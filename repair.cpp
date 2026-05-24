@@ -170,7 +170,6 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
         return useXxh64 ? XXH3_64bits(data, len) : XXH32(data, len, 0);
     };
 
-    std::streampos parityDataStartOffset = static_cast<std::streampos>(headerBlockSize);
 
     std::cout << "Valid archive metadata found!\n";
     std::cout << "Target File Size: " << (globalMeta.originalFileSize / (1024 * 1024.0)) << " MiB\n";
@@ -271,12 +270,14 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
     if (!resolvedDamagedPath.empty()) {
         Progress prog(totalBlocks, "Analysis");
 
+        bool mappingUsed = false;
         os::Mapping mapping;
         const uint8_t* fileData = nullptr;
 
         if (os::MapRead(resolvedDamagedPath.c_str(), mapping)) {
             fileData = static_cast<const uint8_t*>(mapping.data);
             if (fileData) {
+                mappingUsed = true;
                 damagedBlockHashes.resize(totalBlocks);
                 blockCorrupted.assign(totalBlocks, 0);
 
@@ -321,7 +322,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
             }
         }
 
-        if (!mapping.data) {
+        if (!mappingUsed) {
             std::ifstream damagedFile(resolvedDamagedPath, std::ios::binary);
             if (damagedFile.is_open()) {
                 std::vector<uint8_t> blockBuffer(globalMeta.blockSize);
@@ -397,16 +398,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
     parityIn.close();
     std::cout << "Injecting parity packets...\n";
 
-    os::Mapping parityMapping;
-    if (!os::MapRead(parityPath.c_str(), parityMapping)) {
-        std::cerr << "Error: Cannot memory-map parity file.\n";
-        return;
-    }
-    const uint8_t* parityMapBase = static_cast<const uint8_t*>(parityMapping.data);
-
-    const uint8_t* parityBodyPtr = parityMapBase + static_cast<ptrdiff_t>(parityDataStartOffset);
-    size_t parityBodySize = static_cast<size_t>(headerEndOffset - parityDataStartOffset);
-
+    // ── Parse parity packets from primary + supplemental archives ──
     struct ParsedPacket {
         uint32_t fountainId;
         const uint8_t* payload;
@@ -418,11 +410,49 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
     std::vector<std::vector<ParsedPacket>> trackPackets(totalTracks);
     size_t parityPacketsSeen = 0;
 
-    {
+    struct ArchiveMapping {
+        os::Mapping mapping;
+        std::string path;
+    };
+    std::vector<ArchiveMapping> archiveMappings;
+    uint64_t primaryHeaderBlockSize = headerBlockSize;
+
+    auto parsePacketsFromArchive = [&](const std::string& archPath, bool isPrimary) -> bool {
+        os::Mapping mapping;
+        if (!os::MapRead(archPath.c_str(), mapping)) {
+            if (isPrimary) std::cerr << "Error: Cannot memory-map parity file: " << archPath << "\n";
+            else std::cerr << "Warning: Cannot memory-map supplement: " << archPath << "\n";
+            return false;
+        }
+        const uint8_t* base = static_cast<const uint8_t*>(mapping.data);
+        uint64_t fileSz = mapping.size;
+
+        // Find the data section (between the two headers)
+        uint64_t hdrBlockSz = 0;
+        // Read footer to get header block size
+        memcpy(&hdrBlockSz, base + fileSz - sizeof(uint64_t), sizeof(uint64_t));
+        hdrBlockSz = le_to_cpu64(hdrBlockSz);
+        if (hdrBlockSz < sizeof(PacketHeader)) {
+            if (!isPrimary) std::cerr << "Warning: Invalid supplement header size: " << archPath << "\n";
+            os::Unmap(mapping);
+            return false;
+        }
+        uint64_t dataStart = hdrBlockSz;
+        uint64_t mirrorOffset = fileSz - sizeof(uint64_t) - hdrBlockSz;
+        if (dataStart >= mirrorOffset) {
+            if (!isPrimary) std::cerr << "Warning: Corrupt supplement: " << archPath << "\n";
+            os::Unmap(mapping);
+            return false;
+        }
+        uint64_t dataSize = mirrorOffset - dataStart;
+
+        const uint8_t* dataPtr = base + dataStart;
+        size_t dataSz = static_cast<size_t>(dataSize);
+
         size_t bufOff = 0;
-        while (bufOff + sizeof(PacketHeader) <= parityBodySize) {
+        while (bufOff + sizeof(PacketHeader) <= dataSz) {
             PacketHeader pkt;
-            memcpy(&pkt, parityBodyPtr + bufOff, sizeof(pkt));
+            memcpy(&pkt, dataPtr + bufOff, sizeof(pkt));
             pkt.magic = le_to_cpu32(pkt.magic);
             pkt.originalFileSize = le_to_cpu64(pkt.originalFileSize);
             pkt.blockSize = le_to_cpu32(pkt.blockSize);
@@ -434,18 +464,18 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
             bufOff += sizeof(PacketHeader);
 
             if (pkt.magic == WHPAR_MAGIC) {
-                if (bufOff + sizeof(uint32_t) > parityBodySize) break;
-                uint32_t hashCount = le_to_cpu32(*reinterpret_cast<const uint32_t*>(parityBodyPtr + bufOff));
+                if (bufOff + sizeof(uint32_t) > dataSz) break;
+                uint32_t hashCount = le_to_cpu32(*reinterpret_cast<const uint32_t*>(dataPtr + bufOff));
                 bufOff += sizeof(uint32_t) + static_cast<size_t>(hashCount) * sizeof(uint64_t);
-                if (bufOff >= parityBodySize) break;
-                uint8_t hm = parityBodyPtr[bufOff]; bufOff++;
+                if (bufOff >= dataSz) break;
+                uint8_t hm = dataPtr[bufOff]; bufOff++;
                 if (hm) {
-                    if (bufOff + sizeof(uint32_t) > parityBodySize) break;
-                    uint32_t fc = le_to_cpu32(*reinterpret_cast<const uint32_t*>(parityBodyPtr + bufOff));
+                    if (bufOff + sizeof(uint32_t) > dataSz) break;
+                    uint32_t fc = le_to_cpu32(*reinterpret_cast<const uint32_t*>(dataPtr + bufOff));
                     bufOff += sizeof(uint32_t);
                     for (uint32_t i = 0; i < fc; ++i) {
-                        if (bufOff + sizeof(uint32_t) > parityBodySize) break;
-                        uint32_t plen = le_to_cpu32(*reinterpret_cast<const uint32_t*>(parityBodyPtr + bufOff));
+                        if (bufOff + sizeof(uint32_t) > dataSz) break;
+                        uint32_t plen = le_to_cpu32(*reinterpret_cast<const uint32_t*>(dataPtr + bufOff));
                         bufOff += sizeof(uint32_t) + plen + sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t);
                     }
                 }
@@ -463,11 +493,60 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                 continue;
             }
 
-            if (bufOff + pkt.blockSize > parityBodySize) break;
+            if (bufOff + pkt.blockSize > dataSz) break;
 
-            trackPackets[pkt.matrixTrack].push_back({pkt.fountainId, parityBodyPtr + bufOff, pkt.blockSize, pkt.blockSequence, pkt.payloadHash, pkt.expectedBlockHash});
+            trackPackets[pkt.matrixTrack].push_back({pkt.fountainId, dataPtr + bufOff, pkt.blockSize, pkt.blockSequence, pkt.payloadHash, pkt.expectedBlockHash});
             bufOff += pkt.blockSize;
             parityPacketsSeen++;
+        }
+
+        archiveMappings.push_back({std::move(mapping), archPath});
+        return true;
+    };
+
+    // Parse primary archive
+    parsePacketsFromArchive(parityPath, true);
+
+    // Scan for supplemental archives (basename.pNN+NN.whpar)
+    {
+        auto archDir = std::filesystem::path(parityPath).parent_path();
+        if (archDir.empty()) archDir = ".";
+        std::string primaryFn = std::filesystem::path(parityPath).filename().string();
+        // Derive base name: strip .pNN+NN.whpar or .pNN.whpar
+        std::string baseName = primaryFn;
+        {
+            size_t extDot = baseName.rfind('.');
+            if (extDot != std::string::npos) baseName = baseName.substr(0, extDot);
+            // Remove supplemental suffix if present
+            size_t plusPos = baseName.find('+');
+            if (plusPos != std::string::npos) baseName = baseName.substr(0, plusPos);
+            // Remove .pNN
+            size_t ppos = baseName.rfind(".p");
+            if (ppos != std::string::npos && ppos > 0) baseName = baseName.substr(0, ppos);
+        }
+
+        if (std::filesystem::is_directory(archDir)) {
+            for (auto& entry : std::filesystem::directory_iterator(archDir)) {
+                if (!std::filesystem::is_regular_file(entry.path())) continue;
+                std::string name = entry.path().filename().string();
+                // Must end with .whpar, start with baseName, and not be the primary
+                if (name.size() < 7) continue;
+                std::string ext = name.substr(name.size() - 6);
+                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                if (ext != ".whpar") continue;
+                if (name.find(baseName) != 0) continue;
+                // Canonicalize paths to compare
+                std::string absEntry = std::filesystem::absolute(entry.path()).u8string();
+                std::string absPrimary = std::filesystem::absolute(parityPath).u8string();
+                if (absEntry == absPrimary) continue;
+
+                size_t plusPos = name.find('+');
+                if (plusPos == std::string::npos) continue; // only scan supplements (have + in name)
+                if (plusPos >= name.size() - 1) continue;
+
+                std::cout << "Found supplemental archive: " << name << "\n";
+                parsePacketsFromArchive(entry.path().u8string(), false);
+            }
         }
     }
 
@@ -683,7 +762,9 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
     }
     if (fallbackFile.is_open()) fallbackFile.close();
 
-    if (parityMapping.data) os::Unmap(parityMapping);
+    for (auto& am : archiveMappings) {
+        if (am.mapping.data) os::Unmap(am.mapping);
+    }
 
     decodeFeedTime = elapsedSecsSince(tDecodeFeed);
 
@@ -763,7 +844,19 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
     if (executionSuccess) {
         std::cout << "SUCCESS: Data fully recovered.";
     } else {
-        std::cout << "FAILURE: Recovery incomplete.";
+        uint64_t totalHealthy = totalBlocks - corruptedBlocksCount;
+        uint64_t totalParity = parityPacketsSeen;
+        uint64_t needEstimate = 0;
+        for (uint16_t t = 0; t < totalTracks; ++t) {
+            uint64_t h = trackHealthyBlocks[t].size();
+            uint64_t p = trackPackets[t].size();
+            if (p < h + 1) needEstimate += (h + 1) - p;
+        }
+        int extraPct10 = static_cast<int>((needEstimate * 1000.0 / totalBlocks) + 0.5);
+        std::cout << "FAILURE: Repair incomplete. Have " << totalBlocks << " data blocks, "
+                  << totalParity << " parity packets.\n"
+                  << "         Need ~" << needEstimate << " more packets (≈"
+                  << (extraPct10 / 10) << "." << (extraPct10 % 10) << "% additional overhead).";
     }
     showElapsed(); std::cout << "\n";
 }

@@ -18,6 +18,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include "parity.h"
 #include "include/wirehair/wirehair.h"
 #include "create.h"
@@ -27,14 +28,19 @@ static void printUsage() {
     std::cout << "whpar v" << WHPAR_VERSION << " - High-Speed Fountain Parity CLI Tool\n";
     std::cout << "Copyright (C) 2026 Edward Sloter\n\n";
     std::cout << "Usage:\n";
-    std::cout << "  Create Parity:  whpar -c <source> [<output.whpar>] <overhead>\n";
-    std::cout << "                  [-b <sizeKB>] [-j <numJobs>] [--xxh64] [--no-recursive] [-f] [--debug]\n";
-    std::cout << "  Repair Dataset: whpar -r <archive.whpar> [-o <outdir>] [-f] [--debug] [--timing]\n\n";
+    std::cout << "  Create:  whpar -c <source> [<source>...] <overhead>\n";
+    std::cout << "           [-o <output>] [-b <sizeKB>] [-j <numJobs>] [--xxh64] [--no-recursive] [-f] [--debug]\n";
+    std::cout << "  Repair:  whpar -r <archive.whpar> [-o <outdir>] [-f] [--debug] [--timing]\n";
+    std::cout << "  Add:     whpar -a <archive.whpar> <overhead>        [-j <numJobs>] [-f] [--debug]\n\n";
     std::cout << "Options:\n";
-    std::cout << "  -c <source>        Create parity archive for a file or directory\n";
+    std::cout << "  -c <source>        Create parity archive for one or more source files/directories\n";
+    std::cout << "                     Output is auto-named after the first source (use -o to override)\n";
     std::cout << "  --no-recursive     Do not recurse into subdirectories (for -c with directory)\n";
     std::cout << "  -r <archive.whpar> Repair a damaged file using a parity archive\n";
-    std::cout << "  -o <outdir>        Output directory/file for repair (default: current dir)\n";
+    std::cout << "                     Auto-discovers supplemental archives in the same directory\n";
+    std::cout << "  -a <archive.whpar> Generate a supplemental parity file (keeps original intact)\n";
+    std::cout << "                     Requires original source files; output: <base>.p<old>+<add>.whpar\n";
+    std::cout << "  -o <output>        Output path for create or repair\n";
     std::cout << "  -b <sizeKB>        Block size in KB (e.g. 64, 1M, 4G). Default: auto\n";
     std::cout << "  -j <numJobs>       Number of parallel encoding tracks (default: CPU cores)\n";
     std::cout << "  -f, --force        Overwrite existing output without prompting\n";
@@ -44,9 +50,11 @@ static void printUsage() {
     std::cout << "  --version          Show version and exit\n";
     std::cout << "  -h, --help         Show this help message\n";
     std::cout << "\nExamples:\n";
-    std::cout << "  whpar -c movie.mkv archive.whpar 0.10\n";
-    std::cout << "  whpar -c data.zip archive.whpar 0.10 -j 8\n";
+    std::cout << "  whpar -c movie.mkv 0.10\n";
+    std::cout << "  whpar -c data.zip 0.10 -j 8\n";
     std::cout << "  whpar -r archive.whpar -o restored/\n";
+    std::cout << "  whpar -a backup.p10.whpar 0.05   # creates backup.p10+05.whpar\n";
+    std::cout << "  whpar -r backup.p10.whpar -o ./   # auto-uses backup.p10+05.whpar\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -98,6 +106,7 @@ int main(int argc, char* argv[]) {
         bool noRecursive = false;
         uint32_t blockSizeKB = 0;
         uint32_t numJobs = 0;
+        std::string outArg;
 
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
@@ -137,6 +146,10 @@ int main(int argc, char* argv[]) {
                     return 1;
                 }
             }
+            else if (a == "-o") {
+                if (i + 1 < argc) outArg = argv[++i];
+                else { std::cerr << "Error: -o requires a value\n"; return 1; }
+            }
             else posArgs.push_back(a);
         }
 
@@ -147,22 +160,51 @@ int main(int argc, char* argv[]) {
             posArgs.push_back(line);
         }
 
-        std::string sourcePath = posArgs[0];
-        std::string parityPath;
-        std::string overheadStr;
+        std::vector<std::string> sourcePaths(posArgs.begin(), posArgs.end() - 1);
+        std::string overheadStr = posArgs.back();
 
-        if (posArgs.size() == 2) {
-            overheadStr = posArgs[1];
-            size_t lastSep = sourcePath.find_last_of("/\\");
-            std::string baseName = (lastSep == std::string::npos) ? sourcePath : sourcePath.substr(lastSep + 1);
+        float overhead = 0;
+        try {
+            overhead = std::stof(overheadStr);
+        } catch (const std::exception& e) {
+            std::cerr << "Error: Invalid overhead value '" << overheadStr << "' (" << e.what() << ")\n";
+            return 1;
+        }
+        if (overhead <= 0.0f || overhead > 1.0f) {
+            if (overhead >= 1.0f)
+                std::cerr << "Error: Overhead value " << overheadStr << " looks like a percentage (e.g. 10 for 10%).\n"
+                          << "       whpar uses decimal fractions: 0.10 = 10%, 0.05 = 5%, etc.\n"
+                          << "       Try: whpar -c <source> 0.10\n";
+            else
+                std::cerr << "Error: Overhead must be greater than 0.\n";
+            return 1;
+        }
+
+        int pct = static_cast<int>(overhead * 100.0f + 0.5f);
+        if (pct < 1) pct = 1;
+        if (pct > 99) pct = 99;
+        std::string pStr = (pct < 10 ? "0" : "") + std::to_string(pct);
+        std::string pSuffix = ".p" + pStr + ".whpar";
+
+        std::string parityPath;
+        if (outArg.empty()) {
+            size_t lastSep = sourcePaths[0].find_last_of("/\\");
+            std::string baseName = (lastSep == std::string::npos) ? sourcePaths[0] : sourcePaths[0].substr(lastSep + 1);
             size_t dot = baseName.find_last_of('.');
             if (dot != std::string::npos)
                 baseName = baseName.substr(0, dot);
-            parityPath = baseName + ".whpar";
-            std::cerr << "Warning: No output .whpar specified. Using '" << parityPath << "'.\n";
+            parityPath = baseName + pSuffix;
+            std::cerr << "Warning: No output specified. Using '" << parityPath << "'.\n";
         } else {
-            parityPath = posArgs[1];
-            overheadStr = posArgs[2];
+            parityPath = outArg;
+            size_t dot = parityPath.find_last_of('.');
+            if (dot != std::string::npos) {
+                std::string ext = parityPath.substr(dot);
+                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                if (ext == ".whpar")
+                    parityPath = parityPath.substr(0, dot);
+            }
+            parityPath += pSuffix;
         }
 
         if (!force) {
@@ -179,21 +221,10 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        float overhead = 0;
-        try {
-            overhead = std::stof(overheadStr);
-        } catch (const std::exception& e) {
-            std::cerr << "Error: Invalid overhead value '" << overheadStr << "' (" << e.what() << ")\n";
-            return 1;
-        }
-        if (overhead <= 0.0f || overhead > 100.0f) {
-            std::cerr << "Error: Overhead must be between 0.001 and 100.0 (percentage)\n";
-            return 1;
-        }
         if (blockSizeKB > 0 && debug) std::cout << "Using custom block size: " << blockSizeKB << " KB\n";
         if (numJobs > 0) std::cout << "Using " << numJobs << " parallel job(s)\n";
         if (useXxh64) std::cout << "Using XXH3_64bit hashing (--xxh64)\n";
-        CreateParity(sourcePath, parityPath, overhead, debug, blockSizeKB, useXxh64, numJobs, noRecursive);
+        CreateParity(sourcePaths, parityPath, overhead, debug, blockSizeKB, useXxh64, numJobs, noRecursive);
     }
     else if (mode == "-r") {
         if (argc < 3) {
@@ -226,6 +257,66 @@ int main(int argc, char* argv[]) {
         std::string archivePath = posArgs[0];
         std::string targetOut = outDir.empty() ? std::string(".") : outDir;
         RepairDataset(std::string(""), archivePath, targetOut, force, debug, showTiming);
+    }
+    else if (mode == "-a") {
+        std::vector<std::string> posArgs;
+        bool debug = false;
+        bool force = false;
+        uint32_t numJobs = 0;
+
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--debug") debug = true;
+            else if (a == "-f" || a == "--force") force = true;
+            else if (a == "-j" || a == "--jobs") {
+                if (i + 1 < argc) {
+                    try {
+                        numJobs = static_cast<uint32_t>(std::stoul(argv[++i]));
+                    } catch (const std::exception& e) {
+                        std::cerr << "Error: Invalid job count '" << argv[i] << "' (" << e.what() << ")\n";
+                        return 1;
+                    }
+                } else { std::cerr << "Error: --jobs requires a value\n"; return 1; }
+                if (numJobs > 128) { std::cerr << "Error: Job count too large (max 128)\n"; return 1; }
+                if (numJobs == 0) { std::cerr << "Error: Job count must be at least 1\n"; return 1; }
+            }
+            else if (a == "-o") {
+                if (i + 1 < argc) { std::cerr << "Note: -o is not used in add mode; output is auto-named.\n"; ++i; }
+                else ++i;
+            }
+            else posArgs.push_back(a);
+        }
+
+        if (posArgs.size() < 2) {
+            std::cerr << "Error: Missing arguments for add mode.\n";
+            std::cerr << "Usage: whpar -a <archive.whpar> <overhead> [-j <numJobs>] [-f] [--debug]\n";
+            std::cerr << "Creates a supplemental archive (keeps original intact).\n";
+            return 1;
+        }
+
+        if (posArgs.size() > 2) {
+            std::cerr << "Error: Add mode takes exactly 2 positional arguments.\n";
+            return 1;
+        }
+
+        std::string archivePath = posArgs[0];
+        float additionalOverhead = 0;
+        try {
+            additionalOverhead = std::stof(posArgs[1]);
+        } catch (const std::exception& e) {
+            std::cerr << "Error: Invalid overhead value '" << posArgs[1] << "' (" << e.what() << ")\n";
+            return 1;
+        }
+        if (additionalOverhead <= 0.0f || additionalOverhead > 1.0f) {
+            if (additionalOverhead >= 1.0f)
+                std::cerr << "Error: Overhead value " << posArgs[1] << " looks like a percentage.\n"
+                          << "       whpar uses decimal fractions: 0.10 = 10%, 0.05 = 5%, etc.\n";
+            else
+                std::cerr << "Error: Overhead must be greater than 0.\n";
+            return 1;
+        }
+
+        AddParity(archivePath, additionalOverhead, debug, force, numJobs);
     }
     else {
         std::cerr << "Unknown mode: " << mode << "\n";

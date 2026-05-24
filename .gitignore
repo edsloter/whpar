@@ -12,8 +12,10 @@ build/
 *.7z
 *.zip
 *.rar
+*.bin
+*.whpar
 par2j64.exe
-50gb_source.bin
+
 
 # Test / benchmark scripts with local paths
 run_benchmark.ps1
