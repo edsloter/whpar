@@ -42,6 +42,6 @@ add_executable(whpar
 if(MSVC)
     target_compile_options(whpar PRIVATE /O2 /Oi /Ot /W3)
 elseif(UNIX)
-    target_compile_options(whpar PRIVATE -O3 -Wall)
+    target_compile_options(whpar PRIVATE -O3 -Wall -mssse3)
     target_compile_definitions(whpar PRIVATE _POSIX_C_SOURCE=200809L _GNU_SOURCE)
 endif()

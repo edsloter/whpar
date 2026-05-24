@@ -20,6 +20,6 @@
 #include <vector>
 #include <cstdint>
 
-void CreateParity(const std::vector<std::string>& sourcePaths, const std::string& parityPath, float overhead, bool debug = false, uint32_t blockSizeKB = 0, bool useXxh64 = false, uint32_t numJobs = 0, bool noRecursive = false);
+void CreateParity(const std::vector<std::string>& sourcePaths, const std::string& parityPath, float overhead, bool debug = false, uint32_t blockSizeKB = 0, bool useXxh64 = false, uint32_t numJobs = 0, bool noRecursive = false, uint64_t maxMemBytes = 0);
 
-void AddParity(const std::string& archivePath, float additionalOverhead, bool debug = false, bool force = false, uint32_t numJobs = 0, bool noRecursive = false);
+void AddParity(const std::string& archivePath, float additionalOverhead, bool debug = false, bool force = false, uint32_t numJobs = 0, bool noRecursive = false, uint64_t maxMemBytes = 0);
