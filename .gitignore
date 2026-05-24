@@ -1,0 +1,39 @@
+# Build output
+build/
+*.obj
+*.exe
+*.pdb
+*.lib
+*.dll
+*.exp
+*.ilk
+
+# Archives & binaries in source tree
+*.7z
+*.zip
+*.rar
+par2j64.exe
+
+# Test / benchmark scripts with local paths
+run_test.ps1
+run_benchmark.ps1
+bench_50gb.ps1
+bench_vs_par2.ps1
+test_50gb.ps1
+test_folder.ps1
+corrupt.ps1
+
+# Visual Studio / CMake
+*.user
+*.suo
+*.sln.ide/
+.vs/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.vcxproj*
+*.filters
+*.sln
+*.dir/
+x64/
+Release/

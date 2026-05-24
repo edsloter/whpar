@@ -1,0 +1,236 @@
+// whpar - High-Speed Fountain Parity CLI Tool
+// Copyright (C) 2026 Edward Sloter
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published
+// by the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include "parity.h"
+#include "include/wirehair/wirehair.h"
+#include "create.h"
+#include "repair.h"
+
+static void printUsage() {
+    std::cout << "whpar v" << WHPAR_VERSION << " - High-Speed Fountain Parity CLI Tool\n";
+    std::cout << "Copyright (C) 2026 Edward Sloter\n\n";
+    std::cout << "Usage:\n";
+    std::cout << "  Create Parity:  whpar -c <source> [<output.whpar>] <overhead>\n";
+    std::cout << "                  [-b <sizeKB>] [-j <numJobs>] [--xxh64] [--no-recursive] [-f] [--debug]\n";
+    std::cout << "  Repair Dataset: whpar -r <archive.whpar> [-o <outdir>] [-f] [--debug] [--timing]\n\n";
+    std::cout << "Options:\n";
+    std::cout << "  -c <source>        Create parity archive for a file or directory\n";
+    std::cout << "  --no-recursive     Do not recurse into subdirectories (for -c with directory)\n";
+    std::cout << "  -r <archive.whpar> Repair a damaged file using a parity archive\n";
+    std::cout << "  -o <outdir>        Output directory/file for repair (default: current dir)\n";
+    std::cout << "  -b <sizeKB>        Block size in KB (e.g. 64, 1M, 4G). Default: auto\n";
+    std::cout << "  -j <numJobs>       Number of parallel encoding tracks (default: CPU cores)\n";
+    std::cout << "  -f, --force        Overwrite existing output without prompting\n";
+    std::cout << "  --xxh64            Use XXH3_64bit hashing instead of XXH32\n";
+    std::cout << "  --debug            Enable debug output\n";
+    std::cout << "  --timing           Show detailed timing breakdown after repair\n";
+    std::cout << "  --version          Show version and exit\n";
+    std::cout << "  -h, --help         Show this help message\n";
+    std::cout << "\nExamples:\n";
+    std::cout << "  whpar -c movie.mkv archive.whpar 0.10\n";
+    std::cout << "  whpar -c data.zip archive.whpar 0.10 -j 8\n";
+    std::cout << "  whpar -r archive.whpar -o restored/\n";
+}
+
+int main(int argc, char* argv[]) {
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--version") {
+            std::cout << "whpar version " << WHPAR_VERSION << "\n";
+            return 0;
+        }
+        if (a == "-h" || a == "--help") {
+            printUsage();
+            return 0;
+        }
+    }
+
+    if (argc < 2) {
+        printUsage();
+        return 1;
+    }
+
+    std::string mode = argv[1];
+
+    if (wirehair_init() != Wirehair_Success) {
+        std::cerr << "CRITICAL: Wirehair initialization failed!\n";
+        return 1;
+    }
+
+    auto parseSizeKB = [](const std::string& s) -> uint32_t {
+        std::string v = s;
+        // Find where digits end
+        size_t pos = 0;
+        while (pos < v.size() && (v[pos] == '.' || (v[pos] >= '0' && v[pos] <= '9'))) pos++;
+        if (pos == 0) throw std::invalid_argument("no digits");
+        double num = std::stod(v.substr(0, pos));
+        std::string suf;
+        for (size_t i = pos; i < v.size(); i++) suf += static_cast<char>(std::toupper(v[i]));
+        if (suf == "G" || suf == "GB" || suf == "GIB") return static_cast<uint32_t>(num * 1024 * 1024);
+        if (suf == "M" || suf == "MB" || suf == "MIB") return static_cast<uint32_t>(num * 1024);
+        if (suf == "K" || suf == "KB" || suf == "KIB") return static_cast<uint32_t>(num);
+        if (suf == "B") return static_cast<uint32_t>(num / 1024.0 + 0.5);
+        return static_cast<uint32_t>(num);
+    };
+
+    if (mode == "-c") {
+        std::vector<std::string> posArgs;
+        bool debug = false;
+        bool force = false;
+        bool useXxh64 = false;
+        bool noRecursive = false;
+        uint32_t blockSizeKB = 0;
+        uint32_t numJobs = 0;
+
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--debug") debug = true;
+            else if (a == "-f" || a == "--force") force = true;
+            else if (a == "--xxh64") useXxh64 = true;
+            else if (a == "--no-recursive") noRecursive = true;
+            else if (a == "-b" || a == "--block-size") {
+                if (i + 1 < argc) {
+                    try {
+                        blockSizeKB = parseSizeKB(argv[++i]);
+                    } catch (const std::exception& e) {
+                        std::cerr << "Error: Invalid block size '" << argv[i] << "' (" << e.what() << ")\n";
+                        return 1;
+                    }
+                } else { std::cerr << "Error: --block-size requires a value\n"; return 1; }
+                if (blockSizeKB > 1048576) {
+                    std::cerr << "Error: Block size too large (max 1 GB = 1048576 KB)\n";
+                    return 1;
+                }
+            }
+            else if (a == "-j" || a == "--jobs") {
+                if (i + 1 < argc) {
+                    try {
+                        numJobs = static_cast<uint32_t>(std::stoul(argv[++i]));
+                    } catch (const std::exception& e) {
+                        std::cerr << "Error: Invalid job count '" << argv[i] << "' (" << e.what() << ")\n";
+                        return 1;
+                    }
+                } else { std::cerr << "Error: --jobs requires a value\n"; return 1; }
+                if (numJobs > 128) {
+                    std::cerr << "Error: Job count too large (max 128)\n";
+                    return 1;
+                }
+                if (numJobs == 0) {
+                    std::cerr << "Error: Job count must be at least 1\n";
+                    return 1;
+                }
+            }
+            else posArgs.push_back(a);
+        }
+
+        if (posArgs.size() < 2) {
+            std::cout << "Parity overhead percentage (e.g. 0.10 for 10%): ";
+            std::string line;
+            std::getline(std::cin, line);
+            posArgs.push_back(line);
+        }
+
+        std::string sourcePath = posArgs[0];
+        std::string parityPath;
+        std::string overheadStr;
+
+        if (posArgs.size() == 2) {
+            overheadStr = posArgs[1];
+            size_t lastSep = sourcePath.find_last_of("/\\");
+            std::string baseName = (lastSep == std::string::npos) ? sourcePath : sourcePath.substr(lastSep + 1);
+            size_t dot = baseName.find_last_of('.');
+            if (dot != std::string::npos)
+                baseName = baseName.substr(0, dot);
+            parityPath = baseName + ".whpar";
+            std::cerr << "Warning: No output .whpar specified. Using '" << parityPath << "'.\n";
+        } else {
+            parityPath = posArgs[1];
+            overheadStr = posArgs[2];
+        }
+
+        if (!force) {
+            std::ifstream test(parityPath);
+            if (test.good()) {
+                test.close();
+                std::cout << "Warning: '" << parityPath << "' already exists. Overwrite? (y/N): ";
+                std::string answer;
+                std::getline(std::cin, answer);
+                if (answer != "y" && answer != "Y") {
+                    std::cout << "Aborted.\n";
+                    return 1;
+                }
+            }
+        }
+
+        float overhead = 0;
+        try {
+            overhead = std::stof(overheadStr);
+        } catch (const std::exception& e) {
+            std::cerr << "Error: Invalid overhead value '" << overheadStr << "' (" << e.what() << ")\n";
+            return 1;
+        }
+        if (overhead <= 0.0f || overhead > 100.0f) {
+            std::cerr << "Error: Overhead must be between 0.001 and 100.0 (percentage)\n";
+            return 1;
+        }
+        if (blockSizeKB > 0 && debug) std::cout << "Using custom block size: " << blockSizeKB << " KB\n";
+        if (numJobs > 0) std::cout << "Using " << numJobs << " parallel job(s)\n";
+        if (useXxh64) std::cout << "Using XXH3_64bit hashing (--xxh64)\n";
+        CreateParity(sourcePath, parityPath, overhead, debug, blockSizeKB, useXxh64, numJobs, noRecursive);
+    }
+    else if (mode == "-r") {
+        if (argc < 3) {
+            std::cerr << "Error: Missing arguments for repair mode.\n";
+            std::cerr << "Usage: whpar -r <archive.whpar> [-o <outdir_or_file>] [-f]\n";
+            return 1;
+        }
+
+        std::vector<std::string> posArgs;
+        bool force = false;
+        bool debug = false;
+        bool showTiming = false;
+        std::string outDir;
+
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "-o" && i + 1 < argc) { outDir = argv[++i]; }
+            else if (a == "-f" || a == "--force") { force = true; }
+            else if (a == "--debug") { debug = true; }
+            else if (a == "--timing") { showTiming = true; }
+            else posArgs.push_back(a);
+        }
+
+        if (posArgs.size() != 1) {
+            std::cerr << "Error: repair mode now requires exactly one archive path.\n";
+            std::cerr << "Usage: whpar -r <archive.whpar> [-o <outdir_or_file>] [-f] [--debug]\n";
+            return 1;
+        }
+
+        std::string archivePath = posArgs[0];
+        std::string targetOut = outDir.empty() ? std::string(".") : outDir;
+        RepairDataset(std::string(""), archivePath, targetOut, force, debug, showTiming);
+    }
+    else {
+        std::cerr << "Unknown mode: " << mode << "\n";
+        return 1;
+    }
+
+    return 0;
+}
