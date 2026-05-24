@@ -30,8 +30,11 @@ static void printUsage() {
     std::cout << "Usage:\n";
     std::cout << "  Create:  whpar -c <source> [<source>...] <overhead>\n";
     std::cout << "           [-o <output>] [-b <sizeKB>] [-j <numJobs>] [--xxh64] [--no-recursive] [-f] [--debug]\n";
-    std::cout << "  Repair:  whpar -r <archive.whpar> [-o <outdir>] [-f] [--debug] [--timing]\n";
-    std::cout << "  Add:     whpar -a <archive.whpar> <overhead>        [-j <numJobs>] [-f] [--debug]\n\n";
+    std::cout << "  Repair:  whpar -r <archive.whpar> [-o <outdir>] [-j <numJobs>] [--max-mem <size>] [-f] [--debug] [--timing]\n";
+    std::cout << "  Add:     whpar -a <archive.whpar> <overhead>        [-j <numJobs>] [--max-mem <size>] [-f] [--debug]\n";
+    std::cout << "  Info:    whpar -i <archive.whpar> [-o <dir>]                 [--debug]\n";
+    std::cout << "\n";
+    std::cout << "  Default: whpar <archive.whpar>  is equivalent to whpar -i <archive.whpar>\n\n";
     std::cout << "Options:\n";
     std::cout << "  -c <source>        Create parity archive for one or more source files/directories\n";
     std::cout << "                     Output is auto-named after the first source (use -o to override)\n";
@@ -40,11 +43,15 @@ static void printUsage() {
     std::cout << "                     Auto-discovers supplemental archives in the same directory\n";
     std::cout << "  -a <archive.whpar> Generate a supplemental parity file (keeps original intact)\n";
     std::cout << "                     Requires original source files; output: <base>.p<old>+<add>.whpar\n";
+    std::cout << "  -i <archive.whpar> Inspect a parity archive: check all source files against hashes,\n";
+    std::cout << "                     report corruption status, and optionally start repair\n";
     std::cout << "  -o <output>        Output path for create or repair\n";
     std::cout << "  -b <sizeKB>        Block size in KB (e.g. 64, 1M, 4G). Default: auto\n";
-    std::cout << "  -j <numJobs>       Number of parallel encoding tracks (default: CPU cores)\n";
+    std::cout << "  -j <numJobs>       Parallel tracks (create/add) or concurrent decoders (repair). Default: CPU cores\n";
     std::cout << "  -f, --force        Overwrite existing output without prompting\n";
     std::cout << "  --xxh64            Use XXH3_64bit hashing instead of XXH32\n";
+    std::cout << "  --max-mem <size>   Limit memory usage (e.g. 512MB, 4GB). Create/add: stripe processing.\n";
+    std::cout << "                     Repair: streams output to avoid full output buffer.\n";
     std::cout << "  --debug            Enable debug output\n";
     std::cout << "  --timing           Show detailed timing breakdown after repair\n";
     std::cout << "  --version          Show version and exit\n";
@@ -55,6 +62,7 @@ static void printUsage() {
     std::cout << "  whpar -r archive.whpar -o restored/\n";
     std::cout << "  whpar -a backup.p10.whpar 0.05   # creates backup.p10+05.whpar\n";
     std::cout << "  whpar -r backup.p10.whpar -o ./   # auto-uses backup.p10+05.whpar\n";
+    std::cout << "  whpar -i archive.whpar             # check source files against archive\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -76,6 +84,20 @@ int main(int argc, char* argv[]) {
     }
 
     std::string mode = argv[1];
+
+    // If first arg is a .whpar file, default to info mode
+    if (mode.size() > 6) {
+        std::string ext = mode.substr(mode.size() - 6);
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        if (ext == ".whpar") {
+            if (wirehair_init() != Wirehair_Success) {
+                std::cerr << "CRITICAL: Wirehair initialization failed!\n";
+                return 1;
+            }
+            InfoCheck(mode, false, "");
+            return 0;
+        }
+    }
 
     if (wirehair_init() != Wirehair_Success) {
         std::cerr << "CRITICAL: Wirehair initialization failed!\n";
@@ -106,7 +128,23 @@ int main(int argc, char* argv[]) {
         bool noRecursive = false;
         uint32_t blockSizeKB = 0;
         uint32_t numJobs = 0;
+        uint64_t maxMemBytes = 0;
         std::string outArg;
+
+        auto parseMemSize = [](const std::string& s) -> uint64_t {
+            std::string v = s;
+            size_t pos = 0;
+            while (pos < v.size() && (v[pos] == '.' || (v[pos] >= '0' && v[pos] <= '9'))) pos++;
+            if (pos == 0) throw std::invalid_argument("no digits");
+            double num = std::stod(v.substr(0, pos));
+            std::string suf;
+            for (size_t i = pos; i < v.size(); i++) suf += static_cast<char>(std::toupper(v[i]));
+            if (suf == "G" || suf == "GB" || suf == "GIB") return static_cast<uint64_t>(num * 1024ULL * 1024ULL * 1024ULL);
+            if (suf == "M" || suf == "MB" || suf == "MIB") return static_cast<uint64_t>(num * 1024ULL * 1024ULL);
+            if (suf == "K" || suf == "KB" || suf == "KIB") return static_cast<uint64_t>(num * 1024ULL);
+            if (suf == "B") return static_cast<uint64_t>(num);
+            return static_cast<uint64_t>(num);
+        };
 
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
@@ -114,6 +152,20 @@ int main(int argc, char* argv[]) {
             else if (a == "-f" || a == "--force") force = true;
             else if (a == "--xxh64") useXxh64 = true;
             else if (a == "--no-recursive") noRecursive = true;
+            else if (a == "--max-mem") {
+                if (i + 1 < argc) {
+                    try {
+                        maxMemBytes = parseMemSize(argv[++i]);
+                    } catch (const std::exception& e) {
+                        std::cerr << "Error: Invalid --max-mem value '" << argv[i] << "' (" << e.what() << ")\n";
+                        return 1;
+                    }
+                    if (maxMemBytes < 256ULL * 1024ULL) {
+                        std::cerr << "Error: --max-mem must be at least 256 KB\n";
+                        return 1;
+                    }
+                } else { std::cerr << "Error: --max-mem requires a value\n"; return 1; }
+            }
             else if (a == "-b" || a == "--block-size") {
                 if (i + 1 < argc) {
                     try {
@@ -224,7 +276,14 @@ int main(int argc, char* argv[]) {
         if (blockSizeKB > 0 && debug) std::cout << "Using custom block size: " << blockSizeKB << " KB\n";
         if (numJobs > 0) std::cout << "Using " << numJobs << " parallel job(s)\n";
         if (useXxh64) std::cout << "Using XXH3_64bit hashing (--xxh64)\n";
-        CreateParity(sourcePaths, parityPath, overhead, debug, blockSizeKB, useXxh64, numJobs, noRecursive);
+        if (maxMemBytes > 0) {
+            double memMB = static_cast<double>(maxMemBytes) / (1024.0 * 1024.0);
+            std::cout << "Max memory: " << memMB << " MB";
+            if (maxMemBytes >= 1024ULL * 1024ULL * 1024ULL)
+                std::cout << " (" << (maxMemBytes / (1024ULL * 1024ULL * 1024ULL)) << " GB)";
+            std::cout << "\n";
+        }
+        CreateParity(sourcePaths, parityPath, overhead, debug, blockSizeKB, useXxh64, numJobs, noRecursive, maxMemBytes);
     }
     else if (mode == "-r") {
         if (argc < 3) {
@@ -237,7 +296,24 @@ int main(int argc, char* argv[]) {
         bool force = false;
         bool debug = false;
         bool showTiming = false;
+        uint32_t numJobs = 0;
+        uint64_t maxMemBytes = 0;
         std::string outDir;
+
+        auto parseMemSize = [](const std::string& s) -> uint64_t {
+            std::string v = s;
+            size_t pos = 0;
+            while (pos < v.size() && (v[pos] == '.' || (v[pos] >= '0' && v[pos] <= '9'))) pos++;
+            if (pos == 0) throw std::invalid_argument("no digits");
+            double num = std::stod(v.substr(0, pos));
+            std::string suf;
+            for (size_t i = pos; i < v.size(); i++) suf += static_cast<char>(std::toupper(v[i]));
+            if (suf == "G" || suf == "GB" || suf == "GIB") return static_cast<uint64_t>(num * 1024ULL * 1024ULL * 1024ULL);
+            if (suf == "M" || suf == "MB" || suf == "MIB") return static_cast<uint64_t>(num * 1024ULL * 1024ULL);
+            if (suf == "K" || suf == "KB" || suf == "KIB") return static_cast<uint64_t>(num * 1024ULL);
+            if (suf == "B") return static_cast<uint64_t>(num);
+            return static_cast<uint64_t>(num);
+        };
 
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
@@ -245,24 +321,66 @@ int main(int argc, char* argv[]) {
             else if (a == "-f" || a == "--force") { force = true; }
             else if (a == "--debug") { debug = true; }
             else if (a == "--timing") { showTiming = true; }
+            else if (a == "-j" || a == "--jobs") {
+                if (i + 1 < argc) {
+                    try {
+                        numJobs = static_cast<uint32_t>(std::stoul(argv[++i]));
+                    } catch (const std::exception& e) {
+                        std::cerr << "Error: Invalid job count '" << argv[i] << "' (" << e.what() << ")\n";
+                        return 1;
+                    }
+                } else { std::cerr << "Error: --jobs requires a value\n"; return 1; }
+                if (numJobs > 128) { std::cerr << "Error: Job count too large (max 128)\n"; return 1; }
+                if (numJobs == 0) { std::cerr << "Error: Job count must be at least 1\n"; return 1; }
+            }
+            else if (a == "--max-mem") {
+                if (i + 1 < argc) {
+                    try {
+                        maxMemBytes = parseMemSize(argv[++i]);
+                    } catch (const std::exception& e) {
+                        std::cerr << "Error: Invalid --max-mem value '" << argv[i] << "' (" << e.what() << ")\n";
+                        return 1;
+                    }
+                    if (maxMemBytes < 256ULL * 1024ULL) {
+                        std::cerr << "Error: --max-mem must be at least 256 KB\n";
+                        return 1;
+                    }
+                } else { std::cerr << "Error: --max-mem requires a value\n"; return 1; }
+            }
             else posArgs.push_back(a);
         }
 
         if (posArgs.size() != 1) {
             std::cerr << "Error: repair mode now requires exactly one archive path.\n";
-            std::cerr << "Usage: whpar -r <archive.whpar> [-o <outdir_or_file>] [-f] [--debug]\n";
+            std::cerr << "Usage: whpar -r <archive.whpar> [-o <outdir_or_file>] [-f] [--debug] [--timing]\n";
             return 1;
         }
 
         std::string archivePath = posArgs[0];
         std::string targetOut = outDir.empty() ? std::string(".") : outDir;
-        RepairDataset(std::string(""), archivePath, targetOut, force, debug, showTiming);
+        RepairDataset(std::string(""), archivePath, targetOut, force, debug, showTiming, numJobs, maxMemBytes);
     }
     else if (mode == "-a") {
         std::vector<std::string> posArgs;
         bool debug = false;
         bool force = false;
         uint32_t numJobs = 0;
+        uint64_t maxMemBytes = 0;
+
+        auto parseMemSize = [](const std::string& s) -> uint64_t {
+            std::string v = s;
+            size_t pos = 0;
+            while (pos < v.size() && (v[pos] == '.' || (v[pos] >= '0' && v[pos] <= '9'))) pos++;
+            if (pos == 0) throw std::invalid_argument("no digits");
+            double num = std::stod(v.substr(0, pos));
+            std::string suf;
+            for (size_t i = pos; i < v.size(); i++) suf += static_cast<char>(std::toupper(v[i]));
+            if (suf == "G" || suf == "GB" || suf == "GIB") return static_cast<uint64_t>(num * 1024ULL * 1024ULL * 1024ULL);
+            if (suf == "M" || suf == "MB" || suf == "MIB") return static_cast<uint64_t>(num * 1024ULL * 1024ULL);
+            if (suf == "K" || suf == "KB" || suf == "KIB") return static_cast<uint64_t>(num * 1024ULL);
+            if (suf == "B") return static_cast<uint64_t>(num);
+            return static_cast<uint64_t>(num);
+        };
 
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
@@ -279,6 +397,20 @@ int main(int argc, char* argv[]) {
                 } else { std::cerr << "Error: --jobs requires a value\n"; return 1; }
                 if (numJobs > 128) { std::cerr << "Error: Job count too large (max 128)\n"; return 1; }
                 if (numJobs == 0) { std::cerr << "Error: Job count must be at least 1\n"; return 1; }
+            }
+            else if (a == "--max-mem") {
+                if (i + 1 < argc) {
+                    try {
+                        maxMemBytes = parseMemSize(argv[++i]);
+                    } catch (const std::exception& e) {
+                        std::cerr << "Error: Invalid --max-mem value '" << argv[i] << "' (" << e.what() << ")\n";
+                        return 1;
+                    }
+                    if (maxMemBytes < 256ULL * 1024ULL) {
+                        std::cerr << "Error: --max-mem must be at least 256 KB\n";
+                        return 1;
+                    }
+                } else { std::cerr << "Error: --max-mem requires a value\n"; return 1; }
             }
             else if (a == "-o") {
                 if (i + 1 < argc) { std::cerr << "Note: -o is not used in add mode; output is auto-named.\n"; ++i; }
@@ -316,7 +448,25 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        AddParity(archivePath, additionalOverhead, debug, force, numJobs);
+        AddParity(archivePath, additionalOverhead, debug, force, numJobs, false, maxMemBytes);
+    }
+    else if (mode == "-i" || mode == "--info") {
+        std::string archivePath;
+        std::string sourceDir;
+        bool dbg = false;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--debug") dbg = true;
+            else if (a == "-o" && i + 1 < argc) { sourceDir = argv[++i]; }
+            else if (archivePath.empty()) archivePath = a;
+            else { std::cerr << "Error: Unexpected argument: " << a << "\n"; return 1; }
+        }
+        if (archivePath.empty()) {
+            std::cerr << "Error: Missing archive path for info mode.\n";
+            std::cerr << "Usage: whpar -i <archive.whpar> [-o <dir>] [--debug]\n";
+            return 1;
+        }
+        InfoCheck(archivePath, dbg, sourceDir);
     }
     else {
         std::cerr << "Unknown mode: " << mode << "\n";
