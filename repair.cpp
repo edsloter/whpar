@@ -638,6 +638,8 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
     if (totalMemMB > 0 && totalMemMB >= 40ULL * 1024) BATCH_SIZE = 3;
     if (BATCH_SIZE > totalTracks) BATCH_SIZE = totalTracks;
 
+    std::mutex writeMutex;
+
     for (uint16_t batchStart = 0; batchStart < totalTracks && executionSuccess; batchStart += BATCH_SIZE) {
         uint16_t batchEnd = (batchStart + BATCH_SIZE < totalTracks) ? (batchStart + BATCH_SIZE) : totalTracks;
         std::vector<std::future<void>> futures;
@@ -720,6 +722,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                     std::cerr << "Recovery failed on track " << t << " (result=" << static_cast<int>(rr) << ")\n";
                     executionSuccess = false;
                 } else if (inPlace) {
+                    std::lock_guard<std::mutex> lock(writeMutex);
                     os::FileHandle hTrackOut = os::OpenReadWrite(resolvedDamagedPath.c_str());
                     if (hTrackOut != os::InvalidHandle()) {
                         size_t trackByteOffset = 0;
@@ -816,16 +819,48 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                 std::filesystem::create_directories(parent);
                 std::string filePath = (outPath / me.relPath).string();
 
-                std::ofstream outFile(filePath, std::ios::binary);
-                if (outFile) {
-                    outFile.write(reinterpret_cast<const char*>(fullMessage.data() + cumulativeOffset), static_cast<std::streamsize>(me.fileSize));
-                    if (!outFile.good()) {
-                        std::cerr << "Error: Failed to write restored file (disk full?).\n";
-                        return;
+                uint64_t fileStart = cumulativeOffset;
+                uint64_t fileEnd = cumulativeOffset + me.fileSize;
+                bool exists = std::filesystem::exists(filePath)
+                    && std::filesystem::is_regular_file(filePath)
+                    && std::filesystem::file_size(filePath) == me.fileSize;
+
+                if (exists) {
+                    // In-place: only overwrite corrupted blocks
+                    uint64_t firstBlock = fileStart / globalMeta.blockSize;
+                    uint64_t lastBlock = (fileEnd - 1) / globalMeta.blockSize;
+                    os::FileHandle hFile = os::OpenReadWrite(filePath.c_str());
+                    if (hFile != os::InvalidHandle()) {
+                        for (uint64_t g = firstBlock; g <= lastBlock && g < totalBlocks; ++g) {
+                            if (g < blockCorrupted.size() && blockCorrupted[g]) {
+                                uint64_t blockByteStart = g * globalMeta.blockSize;
+                                uint64_t writeStart = (blockByteStart < fileStart) ? fileStart : blockByteStart;
+                                uint64_t blockByteEnd = blockByteStart + globalMeta.blockSize;
+                                if (blockByteEnd > globalMeta.originalFileSize) blockByteEnd = globalMeta.originalFileSize;
+                                uint64_t writeEnd = (blockByteEnd < fileEnd) ? blockByteEnd : fileEnd;
+                                if (writeStart >= writeEnd) continue;
+                                uint64_t localOff = writeStart - fileStart;
+                                uint32_t writeSz = static_cast<uint32_t>(writeEnd - writeStart);
+                                os::Seek(hFile, static_cast<int64_t>(localOff), 0);
+                                os::Write(hFile, fullMessage.data() + writeStart, writeSz);
+                            }
+                        }
+                        os::Close(hFile);
                     }
-                    outFile.close();
                     os::SetAttributes(filePath.c_str(), me.attributes);
                     if (me.mtime > 0) os::SetModificationTime(filePath.c_str(), me.mtime);
+                } else {
+                    std::ofstream outFile(filePath, std::ios::binary);
+                    if (outFile) {
+                        outFile.write(reinterpret_cast<const char*>(fullMessage.data() + cumulativeOffset), static_cast<std::streamsize>(me.fileSize));
+                        if (!outFile.good()) {
+                            std::cerr << "Error: Failed to write restored file (disk full?).\n";
+                            return;
+                        }
+                        outFile.close();
+                        os::SetAttributes(filePath.c_str(), me.attributes);
+                        if (me.mtime > 0) os::SetModificationTime(filePath.c_str(), me.mtime);
+                    }
                 }
                 cumulativeOffset += me.fileSize;
             }

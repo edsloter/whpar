@@ -24,6 +24,7 @@ bench_vs_par2.ps1
 test_50gb.ps1
 test_folder.ps1
 corrupt.ps1
+run_inplace_tests.ps1
 
 # Visual Studio / CMake
 *.user
@@ -39,3 +40,4 @@ cmake_install.cmake
 *.dir/
 x64/
 Release/
+GUI-NOTES.md
