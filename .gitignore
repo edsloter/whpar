@@ -15,7 +15,6 @@ build/
 par2j64.exe
 
 # Test / benchmark scripts with local paths
-run_test.ps1
 run_benchmark.ps1
 bench_50gb.ps1
 bench_vs_par2.ps1

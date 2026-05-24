@@ -13,8 +13,38 @@ It is intended as a compact par2-like encoder/repair tool that produces linear-t
 
 * **High-Speed Performance:** Uses the optimized Wirehair library for linear-time erasure coding.
 * **Self-Describing Packets:** Every parity packet includes precise metadata containing a validation token and target block index.
-* **Resilient Architecture:** Features "mirrored headers" protection. The primary header and hash-index are written at both the start and end of the archive to resist localized index corruption.
+* **Resilient Architecture:** Mirrored headers — the primary header and hash-index are written at both the start and end of the archive to resist localized index corruption. Both copies are further protected by an XXH3-64 ECC checksum to detect silent corruption.
 * **Streamlined CLI:** Clean, distraction-free interface built specifically for creation (`-c`) and restoration (`-r`).
+
+---
+
+## ⚡ Why whpar over PAR2?
+
+| | whpar | PAR2 (par2j64 / phpar2) |
+|---|---|---|
+| **Algorithm** | Fountain code (Wirehair) — **O(n)** linear time | Reed-Solomon — **O(n²)** quadratic time |
+| **Archive format** | Single `.whpar` file | Split `.par2` + `.volNN+NN.par2` files |
+| **Hashing** | xxHash / XXH3\_64bit | CRC32 |
+| **Parallel encode** | Yes — multi-track interleaving | No |
+| **Block metadata** | Self-describing per-packet headers with payload hash + expected block hash | Centralized index only |
+
+PAR2's Reed-Solomon implementation must solve a full matrix inversion for every block — time scales quadratically with block count. For large files with thousands of blocks this becomes extremely slow.
+
+whpar uses **fountain codes** (Wirehair): each parity packet is generated independently in constant time, and decoding is a simple linear feed that stops as soon as enough packets arrive. Encoding and repair both scale **linearly** with file size.
+
+The result: whpar creates parity and repairs damaged files **many times faster** than PAR2, especially on large datasets.
+
+### Benchmark — 50 GB file, 10% overhead, 5% corruption
+
+| Measure | whpar (XXH32) | whpar (XXH3-64) | par2j64 | Speedup (XXH3-64 vs par2j64) |
+|---|---|---|---|---|
+| **Create time** | 151.1 s | 136.6 s | 505.9 s | **3.70×** |
+| **Repair time** | 149.5 s | 147.2 s | 554.3 s | **3.77×** |
+| **Total time** | 300.5 s | 283.8 s | 1060.2 s | **3.74×** |
+| **Parity size** | 5121 MB | 5121 MB | 5120.6 MB | ≈ identical |
+| **Verify** | PASS | PASS | PASS | — |
+
+whpar creates parity ~3.5× faster and repairs ~3.7× faster than par2j64. Parity size is essentially the same at the same overhead percentage. XXH3-64 mode adds a small additional speed advantage over the default XXH32.
 
 ---
 
