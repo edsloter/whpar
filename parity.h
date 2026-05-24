@@ -32,14 +32,23 @@
 #define WHPAR_VERSION "0.0.1"
 
 // On-disk format is little-endian.
-// On x86 (LE) these are no-ops; on big-endian they swap via MSVC intrinsics.
+// On x86 (LE) these are no-ops; on big-endian they swap via compiler intrinsics.
 #ifdef WHPAR_BIG_ENDIAN
+  #ifdef _MSC_VER
     inline uint16_t le_to_cpu16(uint16_t v) { return _byteswap_ushort(v); }
     inline uint32_t le_to_cpu32(uint32_t v) { return _byteswap_ulong(v); }
     inline uint64_t le_to_cpu64(uint64_t v) { return _byteswap_uint64(v); }
     inline uint16_t cpu_to_le16(uint16_t v) { return _byteswap_ushort(v); }
     inline uint32_t cpu_to_le32(uint32_t v) { return _byteswap_ulong(v); }
     inline uint64_t cpu_to_le64(uint64_t v) { return _byteswap_uint64(v); }
+  #else
+    inline uint16_t le_to_cpu16(uint16_t v) { return __builtin_bswap16(v); }
+    inline uint32_t le_to_cpu32(uint32_t v) { return __builtin_bswap32(v); }
+    inline uint64_t le_to_cpu64(uint64_t v) { return __builtin_bswap64(v); }
+    inline uint16_t cpu_to_le16(uint16_t v) { return __builtin_bswap16(v); }
+    inline uint32_t cpu_to_le32(uint32_t v) { return __builtin_bswap32(v); }
+    inline uint64_t cpu_to_le64(uint64_t v) { return __builtin_bswap64(v); }
+  #endif
 #else
     inline uint16_t le_to_cpu16(uint16_t v) { return v; }
     inline uint32_t le_to_cpu32(uint32_t v) { return v; }

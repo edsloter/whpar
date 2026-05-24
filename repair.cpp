@@ -34,7 +34,7 @@
 #include <thread>
 #include <mutex>
 #include <filesystem>
-#include <windows.h>
+#include "portability.h"
 
 void RepairDataset(const std::string& damagedPath, const std::string& parityPath, const std::string& outputPath, bool force, bool debug, bool showTiming) {
     auto startTime = std::chrono::steady_clock::now();
@@ -219,36 +219,35 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
         }
     }
 
-    auto readBlockFromFiles = [&](uint64_t offset, uint32_t size, std::vector<uint8_t>& buf, int& cachedFileIdx, HANDLE& cachedHandle) -> bool {
+    auto readBlockFromFiles = [&](uint64_t offset, uint32_t size, std::vector<uint8_t>& buf, int& cachedFileIdx, os::FileHandle& cachedHandle) -> bool {
         int fileIdx = 0;
         for (size_t f = 0; f < fileStartOffsets.size(); ++f) {
             if (offset >= fileStartOffsets[f] && offset < fileEndOffsets[f]) { fileIdx = static_cast<int>(f); break; }
         }
         if (fileIdx != cachedFileIdx) {
-            if (cachedHandle != INVALID_HANDLE_VALUE) CloseHandle(cachedHandle);
+            if (cachedHandle != os::InvalidHandle()) os::Close(cachedHandle);
             std::string fpath = (std::filesystem::current_path() / canonicalManifest[fileIdx].relPath).string();
-            cachedHandle = CreateFileA(fpath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            cachedHandle = os::OpenRead(fpath.c_str(), false);
             cachedFileIdx = fileIdx;
         }
         std::fill(buf.begin(), buf.end(), 0);
-        if (cachedHandle == INVALID_HANDLE_VALUE) return false;
+        if (cachedHandle == os::InvalidHandle()) return false;
         uint64_t localOff = offset - fileStartOffsets[fileIdx];
         uint64_t avail = fileEndOffsets[fileIdx] - offset;
         size_t firstPart = static_cast<size_t>(std::min<uint64_t>(avail, size));
-        LARGE_INTEGER li; li.QuadPart = static_cast<LONGLONG>(localOff);
-        SetFilePointerEx(cachedHandle, li, NULL, FILE_BEGIN);
-        DWORD br = 0;
-        ReadFile(cachedHandle, buf.data(), static_cast<DWORD>(firstPart), &br, NULL);
+        os::Seek(cachedHandle, static_cast<int64_t>(localOff), 0);
+        uint32_t br = 0;
+        os::Read(cachedHandle, buf.data(), static_cast<uint32_t>(firstPart), br);
         if (firstPart < size) {
             size_t secondPart = size - firstPart;
             int fileIdx2 = fileIdx + 1;
             if (fileIdx2 < static_cast<int>(canonicalManifest.size())) {
                 std::string fpath2 = (std::filesystem::current_path() / canonicalManifest[fileIdx2].relPath).string();
-                HANDLE h2 = CreateFileA(fpath2.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-                if (h2 != INVALID_HANDLE_VALUE) {
-                    DWORD br2 = 0;
-                    ReadFile(h2, buf.data() + firstPart, static_cast<DWORD>(secondPart), &br2, NULL);
-                    CloseHandle(h2);
+                os::FileHandle h2 = os::OpenRead(fpath2.c_str(), false);
+                if (h2 != os::InvalidHandle()) {
+                    uint32_t br2 = 0;
+                    os::Read(h2, buf.data() + firstPart, static_cast<uint32_t>(secondPart), br2);
+                    os::Close(h2);
                 }
             }
         }
@@ -264,8 +263,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
     uint64_t decodeFeedCalls = 0;
 
     const uint8_t* mappedData = nullptr;
-    HANDLE hMapFeed = NULL;
-    HANDLE hFileFeed = INVALID_HANDLE_VALUE;
+    os::Mapping mappingFeed;
     bool hasMapping = false;
     std::ifstream fallbackFile;
     std::mutex fallbackMutex;
@@ -273,18 +271,12 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
     if (!resolvedDamagedPath.empty()) {
         Progress prog(totalBlocks, "Analysis");
 
-        HANDLE hFile = CreateFileA(resolvedDamagedPath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-        bool mappingOk = false;
-        HANDLE hMap = NULL;
+        os::Mapping mapping;
         const uint8_t* fileData = nullptr;
 
-        if (hFile != INVALID_HANDLE_VALUE) {
-            hMap = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-            if (hMap) {
-                fileData = static_cast<const uint8_t*>(MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
-            }
+        if (os::MapRead(resolvedDamagedPath.c_str(), mapping)) {
+            fileData = static_cast<const uint8_t*>(mapping.data);
             if (fileData) {
-                mappingOk = true;
                 damagedBlockHashes.resize(totalBlocks);
                 blockCorrupted.assign(totalBlocks, 0);
 
@@ -325,13 +317,11 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                     }
                 }
 
-                UnmapViewOfFile(fileData);
-                CloseHandle(hMap);
+                os::Unmap(mapping);
             }
-            CloseHandle(hFile);
         }
 
-        if (!mappingOk) {
+        if (!mapping.data) {
             std::ifstream damagedFile(resolvedDamagedPath, std::ios::binary);
             if (damagedFile.is_open()) {
                 std::vector<uint8_t> blockBuffer(globalMeta.blockSize);
@@ -365,7 +355,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
         auto tHashPhase1 = std::chrono::steady_clock::now();
         std::vector<uint8_t> composeBuf(globalMeta.blockSize);
         int curFileIdx = -1;
-        HANDLE hCurFile = INVALID_HANDLE_VALUE;
+        os::FileHandle hCurFile = os::InvalidHandle();
 
         for (uint64_t i = 0; i < totalBlocks; ++i) {
             uint64_t offset = i * globalMeta.blockSize;
@@ -386,7 +376,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
             }
         }
 
-        if (hCurFile != INVALID_HANDLE_VALUE) CloseHandle(hCurFile);
+        if (hCurFile != os::InvalidHandle()) os::Close(hCurFile);
         phase1HashTime = elapsedSecsSince(tHashPhase1);
         prog.done();
         std::cout << "Found " << corruptedBlocksCount << " corrupted block(s).\n";
@@ -407,21 +397,12 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
     parityIn.close();
     std::cout << "Injecting parity packets...\n";
 
-    HANDLE hParityFile = CreateFileA(parityPath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    HANDLE hParityMap = NULL;
-    const uint8_t* parityMapBase = nullptr;
-    if (hParityFile != INVALID_HANDLE_VALUE) {
-        hParityMap = CreateFileMapping(hParityFile, NULL, PAGE_READONLY, 0, 0, NULL);
-        if (hParityMap) {
-            parityMapBase = static_cast<const uint8_t*>(MapViewOfFile(hParityMap, FILE_MAP_READ, 0, 0, 0));
-        }
-    }
-    if (!parityMapBase) {
+    os::Mapping parityMapping;
+    if (!os::MapRead(parityPath.c_str(), parityMapping)) {
         std::cerr << "Error: Cannot memory-map parity file.\n";
-        if (hParityMap) CloseHandle(hParityMap);
-        if (hParityFile != INVALID_HANDLE_VALUE) CloseHandle(hParityFile);
         return;
     }
+    const uint8_t* parityMapBase = static_cast<const uint8_t*>(parityMapping.data);
 
     const uint8_t* parityBodyPtr = parityMapBase + static_cast<ptrdiff_t>(parityDataStartOffset);
     size_t parityBodySize = static_cast<size_t>(headerEndOffset - parityDataStartOffset);
@@ -536,15 +517,12 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
     std::atomic<uint64_t> atomicDecodeCalls{0};
 
     if (!resolvedDamagedPath.empty()) {
-        hFileFeed = CreateFileA(resolvedDamagedPath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hFileFeed != INVALID_HANDLE_VALUE) {
-            hMapFeed = CreateFileMapping(hFileFeed, NULL, PAGE_READONLY, 0, 0, NULL);
-            if (hMapFeed) {
-                mappedData = static_cast<const uint8_t*>(MapViewOfFile(hMapFeed, FILE_MAP_READ, 0, 0, 0));
-                if (mappedData) hasMapping = true;
-            }
-        }
-        if (!hasMapping) {
+        os::Mapping feedMapping;
+        if (os::MapRead(resolvedDamagedPath.c_str(), feedMapping)) {
+            mappedData = static_cast<const uint8_t*>(feedMapping.data);
+            mappingFeed = std::move(feedMapping);
+            hasMapping = true;
+        } else {
             fallbackFile.open(resolvedDamagedPath, std::ios::binary);
         }
     }
@@ -577,11 +555,8 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
     }
 
     unsigned int BATCH_SIZE = 2;
-    MEMORYSTATUSEX ms = { sizeof(ms) };
-    if (GlobalMemoryStatusEx(&ms)) {
-        uint64_t gb = ms.ullTotalPhys / (1024ULL * 1024 * 1024);
-        if (gb >= 40) BATCH_SIZE = 3;
-    }
+    uint64_t totalMemMB = os::TotalMemoryMB();
+    if (totalMemMB > 0 && totalMemMB >= 40ULL * 1024) BATCH_SIZE = 3;
     if (BATCH_SIZE > totalTracks) BATCH_SIZE = totalTracks;
 
     for (uint16_t batchStart = 0; batchStart < totalTracks && executionSuccess; batchStart += BATCH_SIZE) {
@@ -604,7 +579,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                 uint64_t localCalls = 0;
                 std::vector<uint8_t> readBuf(globalMeta.blockSize);
                 int curFileIdx = -1;
-                HANDLE hMultiIn = INVALID_HANDLE_VALUE;
+                os::FileHandle hMultiIn = os::InvalidHandle();
 
                 for (auto& ref : trackHealthyBlocks[t]) {
                     if (solved) break;
@@ -631,7 +606,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                         std::cerr << "Decoder error " << static_cast<int>(res) << " for track " << t << " at block " << ref.internalTrackBlockId << "\n";
                     }
                 }
-                if (hMultiIn != INVALID_HANDLE_VALUE) CloseHandle(hMultiIn);
+                if (hMultiIn != os::InvalidHandle()) os::Close(hMultiIn);
 
                 if (!solved) {
                     for (size_t i = 0; i < trackPackets[t].size(); ++i) {
@@ -666,8 +641,8 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                     std::cerr << "Recovery failed on track " << t << " (result=" << static_cast<int>(rr) << ")\n";
                     executionSuccess = false;
                 } else if (inPlace) {
-                    HANDLE hTrackOut = CreateFileA(resolvedDamagedPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-                    if (hTrackOut != INVALID_HANDLE_VALUE) {
+                    os::FileHandle hTrackOut = os::OpenReadWrite(resolvedDamagedPath.c_str());
+                    if (hTrackOut != os::InvalidHandle()) {
                         size_t trackByteOffset = 0;
                         for (uint64_t g = t; g < totalBlocks; g += totalTracks) {
                             uint64_t fileOff = g * globalMeta.blockSize;
@@ -675,14 +650,12 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                                 ? globalMeta.blockSize
                                 : (globalMeta.originalFileSize - fileOff);
                             if (g < blockCorrupted.size() && blockCorrupted[g]) {
-                                LARGE_INTEGER li; li.QuadPart = static_cast<LONGLONG>(fileOff);
-                                if (!SetFilePointerEx(hTrackOut, li, NULL, FILE_BEGIN)) {
+                                if (!os::Seek(hTrackOut, static_cast<int64_t>(fileOff), 0)) {
                                     std::cerr << "Error: Seek failed during in-place write.\n";
                                     executionSuccess = false;
                                     break;
                                 }
-                                DWORD bytesWritten = 0;
-                                if (!WriteFile(hTrackOut, recoveredTracks[t].data() + trackByteOffset, static_cast<DWORD>(blockSz), &bytesWritten, NULL)) {
+                                if (!os::Write(hTrackOut, recoveredTracks[t].data() + trackByteOffset, static_cast<uint32_t>(blockSz))) {
                                     std::cerr << "Error: Write failed during in-place repair (disk full?).\n";
                                     executionSuccess = false;
                                     break;
@@ -690,7 +663,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                             }
                             trackByteOffset += blockSz;
                         }
-                        CloseHandle(hTrackOut);
+                        os::Close(hTrackOut);
                     }
                     recoveredTracks[t].clear();
                     recoveredTracks[t].shrink_to_fit();
@@ -706,15 +679,11 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
     std::cout << "All tracks completed.\n";
 
     if (hasMapping) {
-        UnmapViewOfFile(mappedData);
-        CloseHandle(hMapFeed);
+        os::Unmap(mappingFeed);
     }
-    if (hFileFeed != INVALID_HANDLE_VALUE) CloseHandle(hFileFeed);
     if (fallbackFile.is_open()) fallbackFile.close();
 
-    if (parityMapBase) UnmapViewOfFile(parityMapBase);
-    if (hParityMap) CloseHandle(hParityMap);
-    if (hParityFile != INVALID_HANDLE_VALUE) CloseHandle(hParityFile);
+    if (parityMapping.data) os::Unmap(parityMapping);
 
     decodeFeedTime = elapsedSecsSince(tDecodeFeed);
 
@@ -774,16 +743,8 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                         return;
                     }
                     outFile.close();
-                    SetFileAttributesA(filePath.c_str(), me.attributes);
-                    HANDLE hOut = CreateFileA(filePath.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-                    if (hOut != INVALID_HANDLE_VALUE) {
-                        FILETIME ft;
-                        LONGLONG ll = Int32x32To64(me.mtime, 10000000) + 116444736000000000LL;
-                        ft.dwLowDateTime = static_cast<DWORD>(ll);
-                        ft.dwHighDateTime = static_cast<DWORD>(ll >> 32);
-                        SetFileTime(hOut, nullptr, nullptr, &ft);
-                        CloseHandle(hOut);
-                    }
+                    os::SetAttributes(filePath.c_str(), me.attributes);
+                    if (me.mtime > 0) os::SetModificationTime(filePath.c_str(), me.mtime);
                 }
                 cumulativeOffset += me.fileSize;
             }

@@ -34,7 +34,7 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
-#include <windows.h>
+#include "portability.h"
 
 void CreateParity(const std::string& sourcePath, const std::string& parityPath, float overhead, bool debug, uint32_t blockSizeKB, bool useXxh64, uint32_t numJobs, bool noRecursive) {
     auto startTime = std::chrono::steady_clock::now();
@@ -69,7 +69,7 @@ void CreateParity(const std::string& sourcePath, const std::string& parityPath, 
             auto ftime = std::filesystem::last_write_time(f);
             auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(ftime - decltype(ftime)::clock::now() + std::chrono::system_clock::now());
             e.mtime = static_cast<uint64_t>(std::chrono::system_clock::to_time_t(sctp));
-            e.attributes = GetFileAttributesA(f.string().c_str());
+            e.attributes = os::GetAttributes(f.string().c_str());
             manifest.push_back(e);
         }
     } else if (std::filesystem::is_regular_file(src)) {
@@ -79,7 +79,7 @@ void CreateParity(const std::string& sourcePath, const std::string& parityPath, 
         auto ftime = std::filesystem::last_write_time(src);
         auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(ftime - decltype(ftime)::clock::now() + std::chrono::system_clock::now());
         e.mtime = static_cast<uint64_t>(std::chrono::system_clock::to_time_t(sctp));
-        e.attributes = GetFileAttributesA(sourcePath.c_str());
+        e.attributes = os::GetAttributes(sourcePath.c_str());
         manifest.push_back(e);
     } else {
         std::cerr << "Error: source path is not a file or directory: " << sourcePath << "\n";
@@ -135,44 +135,42 @@ void CreateParity(const std::string& sourcePath, const std::string& parityPath, 
     }
 
     std::string tempFilePath;
-    HANDLE hReadFile = INVALID_HANDLE_VALUE;
+    os::FileHandle hReadFile = os::InvalidHandle();
     if (manifest.size() == 1) {
         std::string singleFilePath = isSrcDir ? srcFiles[0].string() : sourcePath;
-        hReadFile = CreateFileA(singleFilePath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+        hReadFile = os::OpenRead(singleFilePath.c_str(), true);
     } else if (isSrcDir) {
-        char tempPathBuf[MAX_PATH];
-        GetTempPathA(MAX_PATH, tempPathBuf);
-        HANDLE hTempWrite = INVALID_HANDLE_VALUE;
+        std::string tempDir = os::TempDir();
+        os::FileHandle hTempWrite = os::InvalidHandle();
         for (int attempt = 0; attempt < 100; ++attempt) {
-            tempFilePath = std::string(tempPathBuf) + "whp_" + std::to_string(GetCurrentProcessId()) + "_" + std::to_string(GetTickCount64() + attempt) + ".tmp";
-            hTempWrite = CreateFileA(tempFilePath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-            if (hTempWrite != INVALID_HANDLE_VALUE) break;
+            tempFilePath = tempDir + "whp_" + std::to_string(os::ProcessId()) + "_" + std::to_string(os::TickCount() + attempt) + ".tmp";
+            hTempWrite = os::CreateNew(tempFilePath.c_str(), true);
+            if (hTempWrite != os::InvalidHandle()) break;
             if (attempt == 99) { tempFilePath.clear(); break; }
         }
-        if (hTempWrite == INVALID_HANDLE_VALUE) {
+        if (hTempWrite == os::InvalidHandle()) {
             std::cerr << "Error: Cannot create temp file.\n";
             return;
         }
-        if (hTempWrite != INVALID_HANDLE_VALUE) {
+        if (hTempWrite != os::InvalidHandle()) {
             std::vector<uint8_t> copyBuf(64ULL * 1024 * 1024);
             bool writeFailed = false;
             for (auto& f : srcFiles) {
-                HANDLE hSrc = CreateFileA(f.string().c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-                if (hSrc == INVALID_HANDLE_VALUE) { writeFailed = true; break; }
-                DWORD br = 0;
-                while (ReadFile(hSrc, copyBuf.data(), static_cast<DWORD>(copyBuf.size()), &br, NULL) && br > 0) {
-                    DWORD bw = 0;
-                    if (!WriteFile(hTempWrite, copyBuf.data(), br, &bw, NULL)) { writeFailed = true; break; }
+                os::FileHandle hSrc = os::OpenRead(f.string().c_str(), false);
+                if (hSrc == os::InvalidHandle()) { writeFailed = true; break; }
+                uint32_t br = 0;
+                while (os::Read(hSrc, copyBuf.data(), static_cast<uint32_t>(copyBuf.size()), br) && br > 0) {
+                    if (!os::Write(hTempWrite, copyBuf.data(), br)) { writeFailed = true; break; }
                 }
-                CloseHandle(hSrc);
+                os::Close(hSrc);
                 if (writeFailed) break;
             }
-            CloseHandle(hTempWrite);
+            os::Close(hTempWrite);
             if (!writeFailed) {
-                hReadFile = CreateFileA(tempFilePath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+                hReadFile = os::OpenRead(tempFilePath.c_str(), true);
             }
         }
-        if (hReadFile == INVALID_HANDLE_VALUE) {
+        if (hReadFile == os::InvalidHandle()) {
             allDataFallback.clear();
             for (auto& f : srcFiles) {
                 std::ifstream in(f.string(), std::ios::binary);
@@ -193,9 +191,9 @@ void CreateParity(const std::string& sourcePath, const std::string& parityPath, 
         std::vector<uint8_t> readBuf(readBufSize);
         uint64_t blockIdx = 0;
 
-        if (hReadFile != INVALID_HANDLE_VALUE) {
-            DWORD bytesRead = 0;
-            while (blockIdx < totalBlocks && ReadFile(hReadFile, readBuf.data(), static_cast<DWORD>(readBufSize), &bytesRead, NULL) && bytesRead > 0) {
+        if (hReadFile != os::InvalidHandle()) {
+            uint32_t bytesRead = 0;
+            while (blockIdx < totalBlocks && os::Read(hReadFile, readBuf.data(), static_cast<uint32_t>(readBufSize), bytesRead) && bytesRead > 0) {
                 uint64_t bufOffset = 0;
                 while (bufOffset + blockSize <= bytesRead && blockIdx < totalBlocks) {
                     uint16_t t = static_cast<uint16_t>(blockIdx % totalTracks);
@@ -210,15 +208,15 @@ void CreateParity(const std::string& sourcePath, const std::string& parityPath, 
                 uint64_t offset = blockIdx * blockSize;
                 size_t lastBlockSize = static_cast<size_t>(fileSize - offset);
                 std::vector<uint8_t> lastBuf(lastBlockSize);
-                if (INVALID_SET_FILE_POINTER == SetFilePointer(hReadFile, static_cast<LONG>(offset), NULL, FILE_BEGIN) && GetLastError() != NO_ERROR) {
+                if (!os::Seek(hReadFile, static_cast<int64_t>(offset), 0)) {
                     std::cerr << "Error: Failed to seek in source file.\n";
-                    CloseHandle(hReadFile);
+                    os::Close(hReadFile);
                     return;
                 }
-                DWORD lastRead = 0;
-                if (!ReadFile(hReadFile, lastBuf.data(), static_cast<DWORD>(lastBlockSize), &lastRead, NULL)) {
+                uint32_t lastRead = 0;
+                if (!os::Read(hReadFile, lastBuf.data(), static_cast<uint32_t>(lastBlockSize), lastRead)) {
                     std::cerr << "Error: Failed to read last block from source file.\n";
-                    CloseHandle(hReadFile);
+                    os::Close(hReadFile);
                     return;
                 }
                 uint16_t t = static_cast<uint16_t>(blockIdx % totalTracks);
@@ -226,8 +224,8 @@ void CreateParity(const std::string& sourcePath, const std::string& parityPath, 
                 originalBlockHashes[blockIdx] = useXxh64 ? XXH3_64bits(lastBuf.data(), lastBlockSize) : XXH32(lastBuf.data(), lastBlockSize, 0);
                 prog.tick();
             }
-            CloseHandle(hReadFile);
-            hReadFile = INVALID_HANDLE_VALUE;
+            os::Close(hReadFile);
+            hReadFile = os::InvalidHandle();
         } else if (!allDataFallback.empty()) {
             for (uint64_t i = 0; i < totalBlocks; ++i) {
                 uint64_t offset = i * blockSize;
@@ -315,18 +313,15 @@ void CreateParity(const std::string& sourcePath, const std::string& parityPath, 
     std::ofstream finalOut(parityPath, std::ios::binary);
     if (!finalOut) {
         std::cerr << "Error: Cannot create final parity file.\n";
-        if (!tempFilePath.empty()) DeleteFileA(tempFilePath.c_str());
+        if (!tempFilePath.empty()) os::RemoveFile(tempFilePath.c_str());
         return;
     }
     writeMainHeaderAndHashes(finalOut);
     std::streampos headerEndPos = finalOut.tellp();
 
     unsigned int BATCH_SIZE = 2;
-    MEMORYSTATUSEX ms = { sizeof(ms) };
-    if (GlobalMemoryStatusEx(&ms)) {
-        uint64_t gb = ms.ullTotalPhys / (1024ULL * 1024 * 1024);
-        if (gb >= 40) BATCH_SIZE = 3;
-    }
+    uint64_t totalMB = os::TotalMemoryMB();
+    if (totalMB >= 40960) BATCH_SIZE = 3;
     if (BATCH_SIZE > totalTracks) BATCH_SIZE = totalTracks;
 
     std::vector<std::vector<uint8_t>> trackParityData(totalTracks);
@@ -431,7 +426,7 @@ void CreateParity(const std::string& sourcePath, const std::string& parityPath, 
     std::vector<uint8_t>().swap(allDataFallback);
 
     if (encodeFailed) {
-        if (!tempFilePath.empty()) DeleteFileA(tempFilePath.c_str());
+        if (!tempFilePath.empty()) os::RemoveFile(tempFilePath.c_str());
         return;
     }
 
@@ -451,5 +446,5 @@ void CreateParity(const std::string& sourcePath, const std::string& parityPath, 
     }
     std::cout << std::endl;
 
-    if (!tempFilePath.empty()) DeleteFileA(tempFilePath.c_str());
+    if (!tempFilePath.empty()) os::RemoveFile(tempFilePath.c_str());
 }

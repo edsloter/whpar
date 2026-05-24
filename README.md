@@ -1,7 +1,7 @@
 # whpar
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Platform: Windows](https://img.shields.io/badge/Platform-Windows-blue.svg)](https://microsoft.com/windows)
+[![Platform: Windows | Linux](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-blue.svg)](https://microsoft.com/windows)
 
 **whpar** is a high-speed, linear-time fountain parity CLI utility. It produces and consumes Wirehair-style fountain parity archives (`.whpar`) to protect and repair files against data corruption. 
 
@@ -50,12 +50,11 @@ whpar creates parity ~3.5× faster and repairs ~3.7× faster than par2j64. Parit
 
 ## 🛠️ Installation & Building
 
-Currently, `whpar` is optimized for Windows environments. 
+`whpar` supports **Windows** (native) and **Linux** (via CMake / POSIX portability layer).
 
 ### Prerequisites
-* Windows 10 / 11
-* Visual Studio or Build Tools for Visual Studio (with C++ workflow enabled)
-* PowerShell
+* **Windows:** Visual Studio or Build Tools for VS (C++ workflow), PowerShell
+* **Linux:** GCC or Clang, CMake, make
 
 ### Build Steps
 Clone the repository and run the provided PowerShell helper from the repository root:
