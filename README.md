@@ -163,7 +163,7 @@ FAILURE: Repair incomplete. Have 2341 data blocks, 320 parity packets.
          Need ~51 more packets (≈2.2% additional overhead).
 ```
 
-Repair auto-discovers all supplemental `.whpar` files in the same directory as the primary archive. If more packets are needed, create a new supplement with the shortfall (or more) using `-a`, then re-run repair with all archives present.
+Repair auto-discovers all supplemental `.whpar` files in the same directory as the primary archive. If more packets are needed, have user with original source files create a new supplement with the shortfall (or more) using `-a`, then re-run repair with all archives present.
 
 ### Add Supplementary Parity
 
