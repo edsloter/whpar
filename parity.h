@@ -29,7 +29,7 @@
 
 #define WHPAR_MAGIC 0x32324857
 #define WHPAR_PKT_MAGIC 0x4B504B54
-#define WHPAR_VERSION "0.0.2"
+#define WHPAR_VERSION "0.0.3"
 
 // On-disk format is little-endian.
 // On x86 (LE) these are no-ops; on big-endian they swap via compiler intrinsics.

@@ -36,23 +36,91 @@
 #include <mutex>
 #include "portability.h"
 
-static bool writeParityOutput(
-    const std::string& parityPath,
+static void writeArchiveHeader(
+    std::ofstream& out,
     uint64_t fileSize,
     uint32_t blockSize,
     uint16_t totalTracks,
     bool useXxh64,
     const std::vector<uint64_t>& originalBlockHashes,
     const std::vector<ManifestEntry>& manifest,
+    uint32_t stripeCount,
+    uint64_t blocksPerStripe
+) {
+    std::vector<uint8_t> buf;
+    auto appendBytes = [&](const void* p, size_t n) {
+        auto* b = static_cast<const uint8_t*>(p);
+        buf.insert(buf.end(), b, b + n);
+    };
+
+    PacketHeader mainHeader;
+    mainHeader.magic = WHPAR_MAGIC;
+    mainHeader.originalFileSize = fileSize;
+    mainHeader.blockSize = blockSize;
+    mainHeader.matrixTrack = useXxh64 ? 1 : 0;
+    mainHeader.fountainId = totalTracks;
+    mainHeader.payloadHash = 0;
+    mainHeader.blockSequence = stripeCount;
+    mainHeader.expectedBlockHash = blocksPerStripe;
+
+    PacketHeader hdrLE = mainHeader;
+    hdrLE.magic = cpu_to_le32(hdrLE.magic);
+    hdrLE.originalFileSize = cpu_to_le64(hdrLE.originalFileSize);
+    hdrLE.blockSize = cpu_to_le32(hdrLE.blockSize);
+    hdrLE.matrixTrack = cpu_to_le16(hdrLE.matrixTrack);
+    hdrLE.fountainId = cpu_to_le32(hdrLE.fountainId);
+    hdrLE.payloadHash = cpu_to_le64(hdrLE.payloadHash);
+    hdrLE.blockSequence = cpu_to_le32(hdrLE.blockSequence);
+    hdrLE.expectedBlockHash = cpu_to_le64(hdrLE.expectedBlockHash);
+    appendBytes(&hdrLE, sizeof(hdrLE));
+
+    uint32_t hashCount = cpu_to_le32(static_cast<uint32_t>(originalBlockHashes.size()));
+    appendBytes(&hashCount, sizeof(hashCount));
+    for (auto h : originalBlockHashes) {
+        uint64_t hLE = cpu_to_le64(h);
+        appendBytes(&hLE, sizeof(hLE));
+    }
+
+    uint8_t hasManifest = static_cast<uint8_t>(!manifest.empty());
+    buf.push_back(hasManifest);
+    if (hasManifest) {
+        uint32_t fileCount = cpu_to_le32(static_cast<uint32_t>(manifest.size()));
+        appendBytes(&fileCount, sizeof(fileCount));
+        for (auto& e : manifest) {
+            uint32_t pathLen = cpu_to_le32(static_cast<uint32_t>(e.relPath.size()));
+            appendBytes(&pathLen, sizeof(pathLen));
+            appendBytes(e.relPath.data(), e.relPath.size());
+            uint64_t fsLE = cpu_to_le64(e.fileSize);
+            appendBytes(&fsLE, sizeof(fsLE));
+            uint64_t mtLE = cpu_to_le64(e.mtime);
+            appendBytes(&mtLE, sizeof(mtLE));
+            uint32_t attrLE = cpu_to_le32(e.attributes);
+            appendBytes(&attrLE, sizeof(attrLE));
+        }
+    }
+
+    uint64_t eccHash = XXH3_64bits(buf.data(), buf.size());
+    out.write(reinterpret_cast<const char*>(buf.data()), buf.size());
+    writeU64LE(out, eccHash);
+}
+
+// Encodes parity for one stripe (or the full dataset with stripeIndex=0) and writes to output.
+static bool encodeTrackParityToFile(
+    std::ofstream& finalOut,
+    uint64_t fileSize,
+    uint32_t blockSize,
+    uint16_t totalTracks,
+    bool useXxh64,
+    const std::vector<uint64_t>& originalBlockHashes,
     const std::vector<std::vector<uint8_t>>& trackBufs,
     const std::vector<uint32_t>& trackBlockCounts,
     float overhead,
-    const std::string& tempFilePath,
-    bool debug
+    uint32_t stripeIndex,
+    uint64_t stripeStartBlock,
+    Progress& prog,
+    std::mutex& progMutex,
+    std::atomic<bool>& encodeFailed
 ) {
-    auto startTime = std::chrono::steady_clock::now();
-    uint64_t totalBlocks = (fileSize + blockSize - 1) / blockSize;
-
     std::vector<uint32_t> trackParityCount(totalTracks, 0);
     double carry = 0.0;
     for (uint16_t t = 0; t < totalTracks; ++t) {
@@ -63,87 +131,12 @@ static bool writeParityOutput(
         trackParityCount[t] = blocks;
     }
 
-    uint32_t totalParityBlocks = 0;
-    for (uint16_t t = 0; t < totalTracks; ++t) totalParityBlocks += trackParityCount[t];
-
-    auto writeMainHeaderAndHashes = [&](std::ofstream& out) {
-        std::vector<uint8_t> buf;
-        auto appendBytes = [&](const void* p, size_t n) {
-            auto* b = static_cast<const uint8_t*>(p);
-            buf.insert(buf.end(), b, b + n);
-        };
-
-        PacketHeader mainHeader;
-        mainHeader.magic = WHPAR_MAGIC;
-        mainHeader.originalFileSize = fileSize;
-        mainHeader.blockSize = blockSize;
-        mainHeader.matrixTrack = useXxh64 ? 1 : 0;
-        mainHeader.fountainId = totalTracks;
-        mainHeader.payloadHash = 0;
-        mainHeader.blockSequence = 0;
-        mainHeader.expectedBlockHash = 0;
-
-        PacketHeader hdrLE = mainHeader;
-        hdrLE.magic = cpu_to_le32(hdrLE.magic);
-        hdrLE.originalFileSize = cpu_to_le64(hdrLE.originalFileSize);
-        hdrLE.blockSize = cpu_to_le32(hdrLE.blockSize);
-        hdrLE.matrixTrack = cpu_to_le16(hdrLE.matrixTrack);
-        hdrLE.fountainId = cpu_to_le32(hdrLE.fountainId);
-        hdrLE.payloadHash = cpu_to_le64(hdrLE.payloadHash);
-        hdrLE.blockSequence = cpu_to_le32(hdrLE.blockSequence);
-        hdrLE.expectedBlockHash = cpu_to_le64(hdrLE.expectedBlockHash);
-        appendBytes(&hdrLE, sizeof(hdrLE));
-
-        uint32_t hashCount = cpu_to_le32(static_cast<uint32_t>(originalBlockHashes.size()));
-        appendBytes(&hashCount, sizeof(hashCount));
-        for (auto h : originalBlockHashes) {
-            uint64_t hLE = cpu_to_le64(h);
-            appendBytes(&hLE, sizeof(hLE));
-        }
-
-        uint8_t hasManifest = static_cast<uint8_t>(!manifest.empty());
-        buf.push_back(hasManifest);
-        if (hasManifest) {
-            uint32_t fileCount = cpu_to_le32(static_cast<uint32_t>(manifest.size()));
-            appendBytes(&fileCount, sizeof(fileCount));
-            for (auto& e : manifest) {
-                uint32_t pathLen = cpu_to_le32(static_cast<uint32_t>(e.relPath.size()));
-                appendBytes(&pathLen, sizeof(pathLen));
-                appendBytes(e.relPath.data(), e.relPath.size());
-                uint64_t fsLE = cpu_to_le64(e.fileSize);
-                appendBytes(&fsLE, sizeof(fsLE));
-                uint64_t mtLE = cpu_to_le64(e.mtime);
-                appendBytes(&mtLE, sizeof(mtLE));
-                uint32_t attrLE = cpu_to_le32(e.attributes);
-                appendBytes(&attrLE, sizeof(attrLE));
-            }
-        }
-
-        uint64_t eccHash = XXH3_64bits(buf.data(), buf.size());
-        out.write(reinterpret_cast<const char*>(buf.data()), buf.size());
-        writeU64LE(out, eccHash);
-    };
-
-    std::ofstream finalOut(parityPath, std::ios::binary);
-    if (!finalOut) {
-        std::cerr << "Error: Cannot create parity file '" << parityPath << "'.\n";
-        if (!tempFilePath.empty()) os::RemoveFile(tempFilePath.c_str());
-        return false;
-    }
-    writeMainHeaderAndHashes(finalOut);
-    std::streampos headerEndPos = finalOut.tellp();
-    if (headerEndPos < 0) return false;
-
-    Progress prog(totalParityBlocks, "Parity");
-
     unsigned int BATCH_SIZE = 2;
     uint64_t totalMB = os::TotalMemoryMB();
     if (totalMB >= 40960) BATCH_SIZE = 3;
     if (BATCH_SIZE > totalTracks) BATCH_SIZE = totalTracks;
 
     std::vector<std::vector<uint8_t>> trackParityData(totalTracks);
-    std::atomic<bool> encodeFailed{false};
-    std::mutex progMutex;
 
     for (uint16_t batchStart = 0; batchStart < totalTracks && !encodeFailed; batchStart += BATCH_SIZE) {
         uint16_t batchEnd = (batchStart + BATCH_SIZE < totalTracks) ? (batchStart + BATCH_SIZE) : totalTracks;
@@ -192,10 +185,10 @@ static bool writeParityOutput(
                             header.payloadHash = useXxh64 ? XXH3_64bits(localEncodeBuf.data(), bytesWritten) : XXH32(localEncodeBuf.data(), bytesWritten, 0);
 
                             uint32_t targetLocalIndex = fid % trackBlocks;
-                            uint32_t targetGlobalIndex = targetLocalIndex * totalTracks + t;
+                            uint32_t targetGlobalIndex = static_cast<uint32_t>(stripeStartBlock) + targetLocalIndex * totalTracks + t;
                             if (targetGlobalIndex >= originalBlockHashes.size())
                                 targetGlobalIndex = static_cast<uint32_t>(originalBlockHashes.size() - 1);
-                            header.blockSequence = targetGlobalIndex;
+                            header.blockSequence = stripeIndex;
                             header.expectedBlockHash = originalBlockHashes[targetGlobalIndex];
 
                             auto oldSize = localBuf.size();
@@ -238,6 +231,58 @@ static bool writeParityOutput(
         }
     }
 
+    return !encodeFailed;
+}
+
+static bool writeParityOutput(
+    const std::string& parityPath,
+    uint64_t fileSize,
+    uint32_t blockSize,
+    uint16_t totalTracks,
+    bool useXxh64,
+    const std::vector<uint64_t>& originalBlockHashes,
+    const std::vector<ManifestEntry>& manifest,
+    const std::vector<std::vector<uint8_t>>& trackBufs,
+    const std::vector<uint32_t>& trackBlockCounts,
+    float overhead,
+    const std::string& tempFilePath,
+    bool debug
+) {
+    auto startTime = std::chrono::steady_clock::now();
+
+    std::vector<uint32_t> trackParityCount(totalTracks, 0);
+    double carry = 0.0;
+    for (uint16_t t = 0; t < totalTracks; ++t) {
+        double exact = trackBlockCounts[t] * overhead + carry;
+        uint32_t blocks = static_cast<uint32_t>(exact);
+        carry = exact - blocks;
+        if (blocks == 0 && trackBlockCounts[t] > 0) blocks = 1;
+        trackParityCount[t] = blocks;
+    }
+
+    uint32_t totalParityBlocks = 0;
+    for (uint16_t t = 0; t < totalTracks; ++t) totalParityBlocks += trackParityCount[t];
+
+    std::ofstream finalOut(parityPath, std::ios::binary);
+    if (!finalOut) {
+        std::cerr << "Error: Cannot create parity file '" << parityPath << "'.\n";
+        if (!tempFilePath.empty()) os::RemoveFile(tempFilePath.c_str());
+        return false;
+    }
+    // stripeCount=0, blocksPerStripe=0 for original non-striped archives
+    writeArchiveHeader(finalOut, fileSize, blockSize, totalTracks, useXxh64,
+                       originalBlockHashes, manifest, 0, 0);
+    std::streampos headerEndPos = finalOut.tellp();
+    if (headerEndPos < 0) return false;
+
+    Progress prog(totalParityBlocks, "Parity");
+    std::mutex progMutex;
+    std::atomic<bool> encodeFailed{false};
+
+    encodeTrackParityToFile(finalOut, fileSize, blockSize, totalTracks, useXxh64,
+                            originalBlockHashes, trackBufs, trackBlockCounts,
+                            overhead, 0, 0, prog, progMutex, encodeFailed);
+
     prog.done();
 
     if (encodeFailed) {
@@ -247,7 +292,8 @@ static bool writeParityOutput(
         return false;
     }
 
-    writeMainHeaderAndHashes(finalOut);
+    writeArchiveHeader(finalOut, fileSize, blockSize, totalTracks, useXxh64,
+                       originalBlockHashes, manifest, 0, 0);
     uint64_t hbs = static_cast<uint64_t>(static_cast<std::streamoff>(headerEndPos));
     writeU64LE(finalOut, hbs);
     finalOut.close();
@@ -268,7 +314,7 @@ static bool writeParityOutput(
 
 // ────────────────────────────────────────────────────────────
 
-void CreateParity(const std::vector<std::string>& sourcePaths, const std::string& parityPath, float overhead, bool debug, uint32_t blockSizeKB, bool useXxh64, uint32_t numJobs, bool noRecursive) {
+void CreateParity(const std::vector<std::string>& sourcePaths, const std::string& parityPath, float overhead, bool debug, uint32_t blockSizeKB, bool useXxh64, uint32_t numJobs, bool noRecursive, uint64_t maxMemBytes) {
     auto startTime = std::chrono::steady_clock::now();
 
     std::vector<ManifestEntry> manifest;
@@ -336,6 +382,15 @@ void CreateParity(const std::vector<std::string>& sourcePaths, const std::string
     uint64_t fileSize = 0;
     for (auto& me : manifest) fileSize += me.fileSize;
 
+    uint64_t sysMemMB = os::TotalMemoryMB();
+    if (sysMemMB > 0 && maxMemBytes == 0 && fileSize > sysMemMB * 1024ULL * 1024ULL) {
+        std::cout << "Warning: File size (" << (fileSize / (1024ULL * 1024 * 1024))
+                  << " GB) exceeds total system RAM (" << sysMemMB / 1024
+                  << " GB) and --max-mem is not set.\n"
+                  << "         Without --max-mem, the entire file will be loaded into memory.\n"
+                  << "         Use --max-mem <size> to limit memory usage (e.g. --max-mem 4GB).\n";
+    }
+
     if (numJobs == 0) numJobs = std::thread::hardware_concurrency();
     if (numJobs < 1) numJobs = 1;
     uint16_t totalTracks = static_cast<uint16_t>(numJobs);
@@ -370,17 +425,23 @@ void CreateParity(const std::vector<std::string>& sourcePaths, const std::string
     std::cout << "Interleaving Architecture: " << totalTracks << " parallel track(s)\n";
     std::cout << "Total Blocks: " << totalBlocks << "\n";
 
-    std::vector<uint64_t> originalBlockHashes(totalBlocks);
-    std::vector<uint32_t> trackBlockCounts(totalTracks, 0);
-    for (uint64_t i = 0; i < totalBlocks; ++i) {
-        trackBlockCounts[i % totalTracks]++;
+    // Compute stripe count
+    uint64_t stripeCount = 1;
+    uint64_t blocksPerStripe = totalBlocks;
+    if (maxMemBytes > 0 && fileSize > maxMemBytes) {
+        stripeCount = (fileSize + maxMemBytes - 1) / maxMemBytes;
+        // Ensure at least 1 block per stripe
+        if (stripeCount > totalBlocks) stripeCount = totalBlocks;
+        if (stripeCount < 1) stripeCount = 1;
+        blocksPerStripe = (totalBlocks + stripeCount - 1) / stripeCount;
+        if (debug) {
+            std::cout << "Stripe processing: " << stripeCount << " stripes, "
+                      << blocksPerStripe << " blocks/stripe, "
+                      << (blocksPerStripe * blockSize / (1024 * 1024)) << " MB/stripe\n";
+        }
     }
 
-    std::vector<std::vector<uint8_t>> trackBufs(totalTracks);
-    for (uint16_t t = 0; t < totalTracks; ++t) {
-        trackBufs[t].reserve(trackBlockCounts[t] * blockSize);
-    }
-
+    // Open source file(s)
     std::string tempFilePath;
     os::FileHandle hReadFile = os::InvalidHandle();
     if (srcFiles.size() == 1) {
@@ -429,6 +490,91 @@ void CreateParity(const std::vector<std::string>& sourcePaths, const std::string
         }
     }
 
+    // ── Non-stripe path (default, unchanged) ──
+    if (stripeCount <= 1) {
+        std::vector<uint64_t> originalBlockHashes(totalBlocks);
+        std::vector<uint32_t> trackBlockCounts(totalTracks, 0);
+        for (uint64_t i = 0; i < totalBlocks; ++i) {
+            trackBlockCounts[i % totalTracks]++;
+        }
+
+        std::vector<std::vector<uint8_t>> trackBufs(totalTracks);
+        for (uint16_t t = 0; t < totalTracks; ++t) {
+            trackBufs[t].reserve(trackBlockCounts[t] * blockSize);
+        }
+
+        {
+            Progress prog(totalBlocks, "Hash");
+            uint32_t blocksPerRead = static_cast<uint32_t>((64ULL * 1024 * 1024) / blockSize);
+            if (blocksPerRead < 1) blocksPerRead = 1;
+            size_t readBufSize = static_cast<size_t>(blocksPerRead) * blockSize;
+            std::vector<uint8_t> readBuf(readBufSize);
+            uint64_t blockIdx = 0;
+
+            if (hReadFile != os::InvalidHandle()) {
+                uint32_t bytesRead = 0;
+                while (blockIdx < totalBlocks && os::Read(hReadFile, readBuf.data(), static_cast<uint32_t>(readBufSize), bytesRead) && bytesRead > 0) {
+                    uint64_t bufOffset = 0;
+                    while (bufOffset + blockSize <= bytesRead && blockIdx < totalBlocks) {
+                        uint16_t t = static_cast<uint16_t>(blockIdx % totalTracks);
+                        trackBufs[t].insert(trackBufs[t].end(), readBuf.data() + bufOffset, readBuf.data() + bufOffset + blockSize);
+                        originalBlockHashes[blockIdx] = useXxh64 ? XXH3_64bits(readBuf.data() + bufOffset, blockSize) : XXH32(readBuf.data() + bufOffset, blockSize, 0);
+                        prog.tick();
+                        blockIdx++;
+                        bufOffset += blockSize;
+                    }
+                }
+                if (blockIdx < totalBlocks) {
+                    uint64_t offset = blockIdx * blockSize;
+                    size_t lastBlockSize = static_cast<size_t>(fileSize - offset);
+                    std::vector<uint8_t> lastBuf(lastBlockSize);
+                    if (!os::Seek(hReadFile, static_cast<int64_t>(offset), 0)) {
+                        std::cerr << "Error: Failed to seek in source file.\n";
+                        os::Close(hReadFile);
+                        return;
+                    }
+                    uint32_t lastRead = 0;
+                    if (!os::Read(hReadFile, lastBuf.data(), static_cast<uint32_t>(lastBlockSize), lastRead)) {
+                        std::cerr << "Error: Failed to read last block from source file.\n";
+                        os::Close(hReadFile);
+                        return;
+                    }
+                    uint16_t t = static_cast<uint16_t>(blockIdx % totalTracks);
+                    trackBufs[t].insert(trackBufs[t].end(), lastBuf.data(), lastBuf.data() + lastBlockSize);
+                    originalBlockHashes[blockIdx] = useXxh64 ? XXH3_64bits(lastBuf.data(), lastBlockSize) : XXH32(lastBuf.data(), lastBlockSize, 0);
+                    prog.tick();
+                }
+                os::Close(hReadFile);
+                hReadFile = os::InvalidHandle();
+            } else if (!allDataFallback.empty()) {
+                for (uint64_t i = 0; i < totalBlocks; ++i) {
+                    uint64_t offset = i * blockSize;
+                    size_t currentBlockSize = (offset + blockSize <= fileSize) ? blockSize : static_cast<size_t>(fileSize - offset);
+                    uint16_t t = static_cast<uint16_t>(i % totalTracks);
+                    trackBufs[t].insert(trackBufs[t].end(), allDataFallback.data() + offset, allDataFallback.data() + offset + currentBlockSize);
+                    originalBlockHashes[i] = useXxh64 ? XXH3_64bits(allDataFallback.data() + offset, currentBlockSize) : XXH32(allDataFallback.data() + offset, currentBlockSize, 0);
+                    prog.tick();
+                }
+            }
+            prog.done();
+        }
+        std::vector<uint8_t>().swap(allDataFallback);
+
+        bool ok = writeParityOutput(
+            parityPath, fileSize, blockSize, totalTracks, useXxh64,
+            originalBlockHashes, manifest, trackBufs, trackBlockCounts,
+            overhead, tempFilePath, debug
+        );
+
+        if (!tempFilePath.empty()) os::RemoveFile(tempFilePath.c_str());
+        (void)ok;
+        return;
+    }
+
+    // ── Stripe path (--max-mem) ──
+
+    // Phase 1: Hash pass — read entire source, compute all block hashes (no track buffers)
+    std::vector<uint64_t> originalBlockHashes(totalBlocks);
     {
         Progress prog(totalBlocks, "Hash");
         uint32_t blocksPerRead = static_cast<uint32_t>((64ULL * 1024 * 1024) / blockSize);
@@ -438,12 +584,11 @@ void CreateParity(const std::vector<std::string>& sourcePaths, const std::string
         uint64_t blockIdx = 0;
 
         if (hReadFile != os::InvalidHandle()) {
+            os::Seek(hReadFile, 0, 0);
             uint32_t bytesRead = 0;
             while (blockIdx < totalBlocks && os::Read(hReadFile, readBuf.data(), static_cast<uint32_t>(readBufSize), bytesRead) && bytesRead > 0) {
                 uint64_t bufOffset = 0;
                 while (bufOffset + blockSize <= bytesRead && blockIdx < totalBlocks) {
-                    uint16_t t = static_cast<uint16_t>(blockIdx % totalTracks);
-                    trackBufs[t].insert(trackBufs[t].end(), readBuf.data() + bufOffset, readBuf.data() + bufOffset + blockSize);
                     originalBlockHashes[blockIdx] = useXxh64 ? XXH3_64bits(readBuf.data() + bufOffset, blockSize) : XXH32(readBuf.data() + bufOffset, blockSize, 0);
                     prog.tick();
                     blockIdx++;
@@ -454,30 +599,17 @@ void CreateParity(const std::vector<std::string>& sourcePaths, const std::string
                 uint64_t offset = blockIdx * blockSize;
                 size_t lastBlockSize = static_cast<size_t>(fileSize - offset);
                 std::vector<uint8_t> lastBuf(lastBlockSize);
-                if (!os::Seek(hReadFile, static_cast<int64_t>(offset), 0)) {
-                    std::cerr << "Error: Failed to seek in source file.\n";
-                    os::Close(hReadFile);
-                    return;
-                }
+                os::Seek(hReadFile, static_cast<int64_t>(offset), 0);
                 uint32_t lastRead = 0;
-                if (!os::Read(hReadFile, lastBuf.data(), static_cast<uint32_t>(lastBlockSize), lastRead)) {
-                    std::cerr << "Error: Failed to read last block from source file.\n";
-                    os::Close(hReadFile);
-                    return;
-                }
-                uint16_t t = static_cast<uint16_t>(blockIdx % totalTracks);
-                trackBufs[t].insert(trackBufs[t].end(), lastBuf.data(), lastBuf.data() + lastBlockSize);
+                os::Read(hReadFile, lastBuf.data(), static_cast<uint32_t>(lastBlockSize), lastRead);
                 originalBlockHashes[blockIdx] = useXxh64 ? XXH3_64bits(lastBuf.data(), lastBlockSize) : XXH32(lastBuf.data(), lastBlockSize, 0);
                 prog.tick();
             }
-            os::Close(hReadFile);
-            hReadFile = os::InvalidHandle();
+            // Do NOT close hReadFile — we'll re-use it for stripe reads
         } else if (!allDataFallback.empty()) {
             for (uint64_t i = 0; i < totalBlocks; ++i) {
                 uint64_t offset = i * blockSize;
                 size_t currentBlockSize = (offset + blockSize <= fileSize) ? blockSize : static_cast<size_t>(fileSize - offset);
-                uint16_t t = static_cast<uint16_t>(i % totalTracks);
-                trackBufs[t].insert(trackBufs[t].end(), allDataFallback.data() + offset, allDataFallback.data() + offset + currentBlockSize);
                 originalBlockHashes[i] = useXxh64 ? XXH3_64bits(allDataFallback.data() + offset, currentBlockSize) : XXH32(allDataFallback.data() + offset, currentBlockSize, 0);
                 prog.tick();
             }
@@ -486,14 +618,145 @@ void CreateParity(const std::vector<std::string>& sourcePaths, const std::string
     }
     std::vector<uint8_t>().swap(allDataFallback);
 
-    bool ok = writeParityOutput(
-        parityPath, fileSize, blockSize, totalTracks, useXxh64,
-        originalBlockHashes, manifest, trackBufs, trackBlockCounts,
-        overhead, tempFilePath, debug
-    );
+    // Open output file
+    std::ofstream finalOut(parityPath, std::ios::binary);
+    if (!finalOut) {
+        std::cerr << "Error: Cannot create parity file '" << parityPath << "'.\n";
+        if (!tempFilePath.empty()) os::RemoveFile(tempFilePath.c_str());
+        if (hReadFile != os::InvalidHandle()) os::Close(hReadFile);
+        return;
+    }
+    writeArchiveHeader(finalOut, fileSize, blockSize, totalTracks, useXxh64,
+                       originalBlockHashes, manifest,
+                       static_cast<uint32_t>(stripeCount), blocksPerStripe);
+    std::streampos headerEndPos = finalOut.tellp();
+    if (headerEndPos < 0) {
+        if (!tempFilePath.empty()) os::RemoveFile(tempFilePath.c_str());
+        os::RemoveFile(parityPath.c_str());
+        if (hReadFile != os::InvalidHandle()) os::Close(hReadFile);
+        return;
+    }
+
+    // Pre-compute total parity blocks for progress bar
+    uint64_t totalParityBlocks = 0;
+    for (uint64_t s = 0; s < stripeCount; ++s) {
+        uint64_t sStart = s * blocksPerStripe;
+        uint64_t sEnd = std::min(sStart + blocksPerStripe, totalBlocks);
+        std::vector<uint32_t> counts(totalTracks, 0);
+        for (uint64_t i = sStart; i < sEnd; ++i) counts[i % totalTracks]++;
+        double carry = 0.0;
+        for (uint16_t t = 0; t < totalTracks; ++t) {
+            double exact = counts[t] * overhead + carry;
+            uint32_t blocks = static_cast<uint32_t>(exact);
+            carry = exact - blocks;
+            if (blocks == 0 && counts[t] > 0) blocks = 1;
+            totalParityBlocks += blocks;
+        }
+    }
+
+    Progress prog(totalParityBlocks, "Parity");
+    std::mutex progMutex;
+    std::atomic<bool> encodeFailed{false};
+
+    for (uint64_t s = 0; s < stripeCount && !encodeFailed; ++s) {
+        uint64_t startBlock = s * blocksPerStripe;
+        uint64_t endBlock = std::min(startBlock + blocksPerStripe, totalBlocks);
+
+        if (debug) {
+            std::cout << "Stripe " << s << ": blocks " << startBlock << ".." << (endBlock - 1)
+                      << " (" << (endBlock - startBlock) << " blocks)\n";
+        }
+
+        // Per-stripe track block counts
+        std::vector<uint32_t> sTrackBlockCounts(totalTracks, 0);
+        for (uint64_t i = startBlock; i < endBlock; ++i)
+            sTrackBlockCounts[i % totalTracks]++;
+
+        // Per-stripe track buffers
+        std::vector<std::vector<uint8_t>> trackBufs(totalTracks);
+        for (uint16_t t = 0; t < totalTracks; ++t)
+            trackBufs[t].reserve(sTrackBlockCounts[t] * blockSize);
+
+        // Read stripe data
+        if (hReadFile != os::InvalidHandle()) {
+            uint64_t stripeByteStart = startBlock * blockSize;
+            uint64_t stripeByteEnd = std::min(endBlock * blockSize, fileSize);
+            size_t stripeBytes = static_cast<size_t>(stripeByteEnd - stripeByteStart);
+            std::vector<uint8_t> stripeBuf(stripeBytes);
+            if (!os::Seek(hReadFile, static_cast<int64_t>(stripeByteStart), 0)) {
+                std::cerr << "Error: Seek failed for stripe " << s << "\n";
+                encodeFailed = true;
+                break;
+            }
+            uint32_t bytesRead = 0;
+            if (!os::Read(hReadFile, stripeBuf.data(), static_cast<uint32_t>(stripeBytes), bytesRead)) {
+                std::cerr << "Error: Read failed for stripe " << s << "\n";
+                encodeFailed = true;
+                break;
+            }
+            // Deinterleave
+            for (uint64_t i = startBlock; i < endBlock; ++i) {
+                uint64_t localOff = (i - startBlock) * blockSize;
+                size_t currentBlockSize = (i * blockSize + blockSize <= fileSize)
+                    ? blockSize : static_cast<size_t>(fileSize - i * blockSize);
+                uint16_t t = static_cast<uint16_t>(i % totalTracks);
+                trackBufs[t].insert(trackBufs[t].end(),
+                    stripeBuf.data() + localOff,
+                    stripeBuf.data() + localOff + currentBlockSize);
+            }
+        } else if (!allDataFallback.empty()) {
+            // Fallback — shouldn't happen with large files since allDataFallback is the
+            // in-memory path for small files that didn't get a temp file
+            for (uint64_t i = startBlock; i < endBlock; ++i) {
+                uint64_t offset = i * blockSize;
+                size_t currentBlockSize = (offset + blockSize <= fileSize) ? blockSize : static_cast<size_t>(fileSize - offset);
+                uint16_t t = static_cast<uint16_t>(i % totalTracks);
+                trackBufs[t].insert(trackBufs[t].end(),
+                    allDataFallback.data() + offset,
+                    allDataFallback.data() + offset + currentBlockSize);
+            }
+        }
+
+        // Encode and write parity for this stripe
+        encodeTrackParityToFile(finalOut, fileSize, blockSize, totalTracks, useXxh64,
+                                originalBlockHashes, trackBufs, sTrackBlockCounts,
+                                overhead, static_cast<uint32_t>(s), startBlock,
+                                prog, progMutex, encodeFailed);
+
+        // trackBufs freed at end of scope
+    }
+
+    prog.done();
+
+    if (hReadFile != os::InvalidHandle()) os::Close(hReadFile);
+
+    if (encodeFailed) {
+        finalOut.close();
+        os::RemoveFile(parityPath.c_str());
+        if (!tempFilePath.empty()) os::RemoveFile(tempFilePath.c_str());
+        return;
+    }
+
+    // Write mirror header and footer
+    writeArchiveHeader(finalOut, fileSize, blockSize, totalTracks, useXxh64,
+                       originalBlockHashes, manifest,
+                       static_cast<uint32_t>(stripeCount), blocksPerStripe);
+    uint64_t hbs = static_cast<uint64_t>(static_cast<std::streamoff>(headerEndPos));
+    writeU64LE(finalOut, hbs);
+    finalOut.close();
 
     if (!tempFilePath.empty()) os::RemoveFile(tempFilePath.c_str());
-    (void)ok;
+
+    double elapsed = elapsedSecsSince(startTime);
+    std::cout << "Done! Parity generation completed successfully.";
+    if (elapsed >= 60.0) {
+        int mins = static_cast<int>(elapsed / 60);
+        double secs = elapsed - mins * 60;
+        std::cout << " (" << mins << "m " << secs << "s)";
+    } else {
+        std::cout << " (" << elapsed << "s)";
+    }
+    std::cout << std::endl;
 }
 
 // ────────────────────────────────────────────────────────────
@@ -543,7 +806,7 @@ static int parseCumulativeBasePct(const std::string& archivePath) {
 
 // ────────────────────────────────────────────────────────────
 
-void AddParity(const std::string& archivePath, float additionalOverhead, bool debug, bool force, uint32_t numJobs, bool noRecursive) {
+void AddParity(const std::string& archivePath, float additionalOverhead, bool debug, bool force, uint32_t numJobs, bool noRecursive, uint64_t maxMemBytes) {
     auto startTime = std::chrono::steady_clock::now();
     std::filesystem::path archPath(archivePath);
 
@@ -714,7 +977,7 @@ void AddParity(const std::string& archivePath, float additionalOverhead, bool de
         }
     }
 
-    // ── 5. Read source files into track buffers ───────────
+    // ── 5. Open source data ───────────────────────────────
     bool useXxh64 = (hdr.matrixTrack == 1);
     uint64_t fileSize = hdr.originalFileSize;
     uint32_t blockSize = hdr.blockSize;
@@ -726,13 +989,6 @@ void AddParity(const std::string& archivePath, float additionalOverhead, bool de
     std::cout << "Block Size: " << (blockSize / 1024) << " KB\n";
     std::cout << "Interleaving Architecture: " << totalTracks << " parallel track(s)\n";
     std::cout << "Total Blocks: " << totalBlocks << "\n";
-
-    std::vector<uint32_t> trackBlockCounts(totalTracks, 0);
-    for (uint64_t i = 0; i < totalBlocks; ++i) trackBlockCounts[i % totalTracks]++;
-
-    std::vector<std::vector<uint8_t>> trackBufs(totalTracks);
-    for (uint16_t t = 0; t < totalTracks; ++t)
-        trackBufs[t].reserve(trackBlockCounts[t] * blockSize);
 
     std::vector<uint8_t> allData;
     std::string tempFilePath;
@@ -777,64 +1033,222 @@ void AddParity(const std::string& archivePath, float additionalOverhead, bool de
         }
     }
 
-    {
-        Progress prog(totalBlocks, "Hash");
-        if (hConcat != os::InvalidHandle()) {
-            uint32_t blocksPerRead = static_cast<uint32_t>((64ULL * 1024 * 1024) / blockSize);
-            if (blocksPerRead < 1) blocksPerRead = 1;
-            size_t readBufSize = static_cast<size_t>(blocksPerRead) * blockSize;
-            std::vector<uint8_t> readBuf(readBufSize);
-            uint64_t blockIdx = 0;
-            uint32_t bytesRead = 0;
-            while (blockIdx < totalBlocks && os::Read(hConcat, readBuf.data(), static_cast<uint32_t>(readBufSize), bytesRead) && bytesRead > 0) {
-                uint64_t bufOffset = 0;
-                while (bufOffset + blockSize <= bytesRead && blockIdx < totalBlocks) {
-                    uint16_t t = static_cast<uint16_t>(blockIdx % totalTracks);
-                    trackBufs[t].insert(trackBufs[t].end(), readBuf.data() + bufOffset, readBuf.data() + bufOffset + blockSize);
-                    prog.tick();
-                    blockIdx++;
-                    bufOffset += blockSize;
-                }
-            }
-            if (blockIdx < totalBlocks) {
-                uint64_t offset = blockIdx * blockSize;
-                size_t lastBlockSize = static_cast<size_t>(fileSize - offset);
-                std::vector<uint8_t> lastBuf(lastBlockSize);
-                if (!os::Seek(hConcat, static_cast<int64_t>(offset), 0)) {
-                    std::cerr << "Error: Seek failed.\n"; os::Close(hConcat); return;
-                }
-                uint32_t lastRead = 0;
-                if (!os::Read(hConcat, lastBuf.data(), static_cast<uint32_t>(lastBlockSize), lastRead)) {
-                    std::cerr << "Error: Read failed.\n"; os::Close(hConcat); return;
-                }
-                uint16_t t = static_cast<uint16_t>(blockIdx % totalTracks);
-                trackBufs[t].insert(trackBufs[t].end(), lastBuf.data(), lastBuf.data() + lastBlockSize);
-                prog.tick();
-            }
-            os::Close(hConcat);
-        } else if (!allData.empty()) {
-            for (uint64_t i = 0; i < totalBlocks; ++i) {
-                uint64_t offset = i * blockSize;
-                size_t currentBlockSize = (offset + blockSize <= fileSize) ? blockSize : static_cast<size_t>(fileSize - offset);
-                uint16_t t = static_cast<uint16_t>(i % totalTracks);
-                trackBufs[t].insert(trackBufs[t].end(), allData.data() + offset, allData.data() + offset + currentBlockSize);
-                prog.tick();
-            }
+    // ── 6. Compute stripe count ───────────────────────────
+    uint64_t stripeCount = 1;
+    uint64_t blocksPerStripe = totalBlocks;
+    if (maxMemBytes > 0 && fileSize > maxMemBytes) {
+        stripeCount = (fileSize + maxMemBytes - 1) / maxMemBytes;
+        if (stripeCount > totalBlocks) stripeCount = totalBlocks;
+        if (stripeCount < 1) stripeCount = 1;
+        blocksPerStripe = (totalBlocks + stripeCount - 1) / stripeCount;
+        if (debug) {
+            std::cout << "Stripe processing: " << stripeCount << " stripes, "
+                      << blocksPerStripe << " blocks/stripe, "
+                      << (blocksPerStripe * blockSize / (1024 * 1024)) << " MB/stripe\n";
         }
-        prog.done();
     }
 
-    // ── 6. Write supplemental archive with only the additional parity ──
+    // ── 7. Generate parity (non-stripe or stripe path) ──
     float additionalOverheadFrac = addPct / 100.0f;
     std::cout << "Encoding " << addPct << "% additional parity...\n";
-    bool ok = writeParityOutput(
-        outputPath, fileSize, blockSize, totalTracks, useXxh64,
-        blockHashes, manifest, trackBufs, trackBlockCounts,
-        additionalOverheadFrac, tempFilePath, debug
-    );
 
-    if (!tempFilePath.empty()) os::RemoveFile(tempFilePath.c_str());
-    if (ok) {
+    if (stripeCount <= 1) {
+        // ── Non-stripe path (load all, encode once) ──
+        std::vector<uint32_t> trackBlockCounts(totalTracks, 0);
+        for (uint64_t i = 0; i < totalBlocks; ++i) trackBlockCounts[i % totalTracks]++;
+
+        std::vector<std::vector<uint8_t>> trackBufs(totalTracks);
+        for (uint16_t t = 0; t < totalTracks; ++t)
+            trackBufs[t].reserve(trackBlockCounts[t] * blockSize);
+
+        {
+            Progress prog(totalBlocks, "Hash");
+            if (hConcat != os::InvalidHandle()) {
+                uint32_t blocksPerRead = static_cast<uint32_t>((64ULL * 1024 * 1024) / blockSize);
+                if (blocksPerRead < 1) blocksPerRead = 1;
+                size_t readBufSize = static_cast<size_t>(blocksPerRead) * blockSize;
+                std::vector<uint8_t> readBuf(readBufSize);
+                uint64_t blockIdx = 0;
+                uint32_t bytesRead = 0;
+                while (blockIdx < totalBlocks && os::Read(hConcat, readBuf.data(), static_cast<uint32_t>(readBufSize), bytesRead) && bytesRead > 0) {
+                    uint64_t bufOffset = 0;
+                    while (bufOffset + blockSize <= bytesRead && blockIdx < totalBlocks) {
+                        uint16_t t = static_cast<uint16_t>(blockIdx % totalTracks);
+                        trackBufs[t].insert(trackBufs[t].end(), readBuf.data() + bufOffset, readBuf.data() + bufOffset + blockSize);
+                        prog.tick();
+                        blockIdx++;
+                        bufOffset += blockSize;
+                    }
+                }
+                if (blockIdx < totalBlocks) {
+                    uint64_t offset = blockIdx * blockSize;
+                    size_t lastBlockSize = static_cast<size_t>(fileSize - offset);
+                    std::vector<uint8_t> lastBuf(lastBlockSize);
+                    if (!os::Seek(hConcat, static_cast<int64_t>(offset), 0)) {
+                        std::cerr << "Error: Seek failed.\n"; os::Close(hConcat); return;
+                    }
+                    uint32_t lastRead = 0;
+                    if (!os::Read(hConcat, lastBuf.data(), static_cast<uint32_t>(lastBlockSize), lastRead)) {
+                        std::cerr << "Error: Read failed.\n"; os::Close(hConcat); return;
+                    }
+                    uint16_t t = static_cast<uint16_t>(blockIdx % totalTracks);
+                    trackBufs[t].insert(trackBufs[t].end(), lastBuf.data(), lastBuf.data() + lastBlockSize);
+                    prog.tick();
+                }
+                os::Close(hConcat);
+            } else if (!allData.empty()) {
+                for (uint64_t i = 0; i < totalBlocks; ++i) {
+                    uint64_t offset = i * blockSize;
+                    size_t currentBlockSize = (offset + blockSize <= fileSize) ? blockSize : static_cast<size_t>(fileSize - offset);
+                    uint16_t t = static_cast<uint16_t>(i % totalTracks);
+                    trackBufs[t].insert(trackBufs[t].end(), allData.data() + offset, allData.data() + offset + currentBlockSize);
+                    prog.tick();
+                }
+            }
+            prog.done();
+        }
+
+        bool ok = writeParityOutput(
+            outputPath, fileSize, blockSize, totalTracks, useXxh64,
+            blockHashes, manifest, trackBufs, trackBlockCounts,
+            additionalOverheadFrac, tempFilePath, debug
+        );
+
+        if (!tempFilePath.empty()) os::RemoveFile(tempFilePath.c_str());
+        if (ok) {
+            double elapsed = elapsedSecsSince(startTime);
+            std::cout << "Supplemental archive created: " << outputPath;
+            if (elapsed >= 60.0) {
+                int mins = static_cast<int>(elapsed / 60);
+                double secs = elapsed - mins * 60;
+                std::cout << " (" << mins << "m " << secs << "s)";
+            } else {
+                std::cout << " (" << elapsed << "s)";
+            }
+            std::cout << "\n";
+            std::cout << "Keep all archive files together for repair.\n";
+            std::cout << "Repair auto-discovers all matching .whpar files.\n";
+        }
+    } else {
+        // ── Stripe path ──
+        std::ofstream finalOut(outputPath, std::ios::binary);
+        if (!finalOut) {
+            std::cerr << "Error: Cannot create supplemental archive '" << outputPath << "'.\n";
+            if (hConcat != os::InvalidHandle()) os::Close(hConcat);
+            if (!tempFilePath.empty()) os::RemoveFile(tempFilePath.c_str());
+            return;
+        }
+
+        writeArchiveHeader(finalOut, fileSize, blockSize, totalTracks, useXxh64,
+                          blockHashes, manifest,
+                          static_cast<uint32_t>(stripeCount), blocksPerStripe);
+        std::streampos headerEndPos = finalOut.tellp();
+        if (headerEndPos < 0) {
+            if (hConcat != os::InvalidHandle()) os::Close(hConcat);
+            if (!tempFilePath.empty()) os::RemoveFile(tempFilePath.c_str());
+            os::RemoveFile(outputPath.c_str());
+            return;
+        }
+
+        uint64_t totalParityBlocks = 0;
+        for (uint64_t s = 0; s < stripeCount; ++s) {
+            uint64_t sStart = s * blocksPerStripe;
+            uint64_t sEnd = std::min(sStart + blocksPerStripe, totalBlocks);
+            std::vector<uint32_t> counts(totalTracks, 0);
+            for (uint64_t i = sStart; i < sEnd; ++i) counts[i % totalTracks]++;
+            double carry = 0.0;
+            for (uint16_t t = 0; t < totalTracks; ++t) {
+                double exact = counts[t] * additionalOverheadFrac + carry;
+                uint32_t blocks = static_cast<uint32_t>(exact);
+                carry = exact - blocks;
+                if (blocks == 0 && counts[t] > 0) blocks = 1;
+                totalParityBlocks += blocks;
+            }
+        }
+
+        Progress prog(totalParityBlocks, "Parity");
+        std::mutex progMutex;
+        std::atomic<bool> encodeFailed{false};
+
+        for (uint64_t s = 0; s < stripeCount && !encodeFailed; ++s) {
+            uint64_t startBlock = s * blocksPerStripe;
+            uint64_t endBlock = std::min(startBlock + blocksPerStripe, totalBlocks);
+
+            if (debug) {
+                std::cout << "Stripe " << s << ": blocks " << startBlock << ".." << (endBlock - 1)
+                          << " (" << (endBlock - startBlock) << " blocks)\n";
+            }
+
+            std::vector<uint32_t> sTrackBlockCounts(totalTracks, 0);
+            for (uint64_t i = startBlock; i < endBlock; ++i)
+                sTrackBlockCounts[i % totalTracks]++;
+
+            std::vector<std::vector<uint8_t>> trackBufs(totalTracks);
+            for (uint16_t t = 0; t < totalTracks; ++t)
+                trackBufs[t].reserve(sTrackBlockCounts[t] * blockSize);
+
+            if (hConcat != os::InvalidHandle()) {
+                uint64_t stripeByteStart = startBlock * blockSize;
+                uint64_t stripeByteEnd = std::min(endBlock * blockSize, fileSize);
+                size_t stripeBytes = static_cast<size_t>(stripeByteEnd - stripeByteStart);
+                std::vector<uint8_t> stripeBuf(stripeBytes);
+                if (!os::Seek(hConcat, static_cast<int64_t>(stripeByteStart), 0)) {
+                    std::cerr << "Error: Seek failed for stripe " << s << "\n";
+                    encodeFailed = true;
+                    break;
+                }
+                uint32_t bytesRead = 0;
+                if (!os::Read(hConcat, stripeBuf.data(), static_cast<uint32_t>(stripeBytes), bytesRead)) {
+                    std::cerr << "Error: Read failed for stripe " << s << "\n";
+                    encodeFailed = true;
+                    break;
+                }
+                for (uint64_t i = startBlock; i < endBlock; ++i) {
+                    uint64_t localOff = (i - startBlock) * blockSize;
+                    size_t currentBlockSize = (i * blockSize + blockSize <= fileSize)
+                        ? blockSize : static_cast<size_t>(fileSize - i * blockSize);
+                    uint16_t t = static_cast<uint16_t>(i % totalTracks);
+                    trackBufs[t].insert(trackBufs[t].end(),
+                        stripeBuf.data() + localOff,
+                        stripeBuf.data() + localOff + currentBlockSize);
+                }
+            } else if (!allData.empty()) {
+                for (uint64_t i = startBlock; i < endBlock; ++i) {
+                    uint64_t offset = i * blockSize;
+                    size_t currentBlockSize = (offset + blockSize <= fileSize) ? blockSize : static_cast<size_t>(fileSize - offset);
+                    uint16_t t = static_cast<uint16_t>(i % totalTracks);
+                    trackBufs[t].insert(trackBufs[t].end(),
+                        allData.data() + offset,
+                        allData.data() + offset + currentBlockSize);
+                }
+            }
+
+            encodeTrackParityToFile(finalOut, fileSize, blockSize, totalTracks, useXxh64,
+                                    blockHashes, trackBufs, sTrackBlockCounts,
+                                    additionalOverheadFrac, static_cast<uint32_t>(s), startBlock,
+                                    prog, progMutex, encodeFailed);
+        }
+
+        prog.done();
+
+        if (hConcat != os::InvalidHandle()) os::Close(hConcat);
+
+        if (encodeFailed) {
+            finalOut.close();
+            os::RemoveFile(outputPath.c_str());
+            if (!tempFilePath.empty()) os::RemoveFile(tempFilePath.c_str());
+            return;
+        }
+
+        writeArchiveHeader(finalOut, fileSize, blockSize, totalTracks, useXxh64,
+                          blockHashes, manifest,
+                          static_cast<uint32_t>(stripeCount), blocksPerStripe);
+        uint64_t hbs = static_cast<uint64_t>(static_cast<std::streamoff>(headerEndPos));
+        writeU64LE(finalOut, hbs);
+        finalOut.close();
+
+        if (!tempFilePath.empty()) os::RemoveFile(tempFilePath.c_str());
+
         double elapsed = elapsedSecsSince(startTime);
         std::cout << "Supplemental archive created: " << outputPath;
         if (elapsed >= 60.0) {

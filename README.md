@@ -81,6 +81,7 @@ The compiled binary will be located at `build\Release\whpar.exe`.
 whpar -c <source> [<source>...] <overhead>  [options]   # create parity
 whpar -r <archive.whpar>                    [options]   # repair (auto-discovers supplements)
 whpar -a <archive.whpar> <overhead>                     # add supplementary parity
+whpar -i <archive.whpar>                    [options]   # inspect archive health
 ```
 
 ### Create a Parity Archive
@@ -126,10 +127,13 @@ Primary archives follow the pattern `<name>.pNN.whpar`, where **N** is the overh
 The **pNN** value is the *cumulative* overhead of the archive being supplemented, and **+MM** is what this supplement adds. Repair auto-discovers all `.whpar` files with a matching base name.
 
 | Option | Description |
-|---|---|
+|---|---|---|
 | `-b <sizeKB>` | Block size in KB (e.g. `64`, `1M`, `4G`). Auto-selected by default. |
-| `-j <numJobs>` | Number of parallel encoding tracks (default: CPU core count). |
+| `-j <numJobs>` | Parallel encoding tracks (create/add) or concurrent decoders (repair). Default: CPU core count. |
 | `--xxh64` | Use XXH3\_64bit hashing instead of XXH32 for faster/larger checksums. |
+| `--max-mem <size>` | Memory limit (e.g. `512MB`, `2GB`, `4G`). Minimum 256 KB. |
+| | **Create/Add:** By default whpar loads the entire source into RAM. With this flag the encoder processes the file in stripes that each fit within the budget — lower values increase passes but reduce peak RAM. |
+| | **Repair:** By default repair holds the full recovered data plus an output buffer in memory (~2× file size). With this flag output is streamed directly to disk per-block, eliminating the output buffer. Pair with `-j 1` to minimize peak memory. |
 | `--no-recursive` | Only process files in the given directory, not subdirectories. |
 | `-f, --force` | Overwrite existing output without prompting. |
 | `--debug` | Enable debug output during encoding. |
@@ -137,16 +141,35 @@ The **pNN** value is the *cumulative* overhead of the archive being supplemented
 * **Example (10% overhead):** `whpar -c data.iso 0.10` → `data.p10.whpar`
 * **Example (8 parallel tracks, custom output):** `whpar -c data.iso 0.10 -o myarchive -j 8` → `myarchive.p10.whpar`
 
+### Inspect Archive Health
+
+Check whether source files match the archive's block hashes without performing any repair.
+
+```bash
+whpar -i <archive.whpar> [-o <dir>] [--debug]
+```
+
+`-i` reads the archive (and any auto-discovered supplements), hashes all source files found in the `-o` directory (or archive directory, or current directory), and reports:
+
+- Which blocks are healthy vs corrupted
+- Total parity packets available and their validity
+- Estimated additional overhead needed if repair would fail
+- **Prompt to run repair** if corruption is detected
+
+No recovered data is written — this is a dry-run check.
+
 ### Repair a Damaged File
 Recover a corrupted file using a parity archive. Repair **auto-discovers all supplemental archives** in the same directory with a matching base name — keep the primary and all supplements together.
 
 ```bash
-whpar -r <parity.whpar> [-o <outpath>] [-f] [--debug] [--timing]
+whpar -r <parity.whpar> [-o <outpath>] [-j <numJobs>] [--max-mem <size>] [-f] [--debug] [--timing]
 ```
 
 | Option | Description |
-|---|---|
+|---|---|---|
 | `-o <outpath>` | Destination path. For multi-file archives this must be a directory. For single-file archives, may be a directory or explicit filename. |
+| `-j <numJobs>` | Concurrent decoder tracks (1–128). Default: auto (2 or 3 based on system RAM). Use `-j 1` to halve peak decoder memory. |
+| `--max-mem <size>` | Stream recovered data directly to disk per-block, avoiding the ~2× file size output buffer. Pair with `-j 1` when total RAM is limited. |
 | `-f, --force` | Force overwrite / suppress interactive warnings. |
 | `--debug` | Enable debug output during repair. |
 | `--timing` | Show detailed timing breakdown (hash, decode, inject phases). |
@@ -172,10 +195,10 @@ Generate additional parity for an existing archive without re-creating the whole
 - You want to distribute incremental parity later (e.g., user A has the source + original archive, user B needs more recovery packets without re-downloading everything)
 
 ```bash
-whpar -a <archive.whpar> <overhead>
+whpar -a <archive.whpar> <overhead> [-j <numJobs>] [--max-mem <size>] [-f] [--debug]
 ```
 
-`-a` reads an existing `.whpar`, generates **only the requested overhead** in new parity packets, and writes a new supplemental file. The original archive is never modified.
+`-a` reads an existing `.whpar`, generates **only the requested overhead** in new parity packets, and writes a new supplemental file. The original archive is never modified. Supports `-j` and `--max-mem` (same as `-c`).
 
 | Example | What happens |
 |---|---|
