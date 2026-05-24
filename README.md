@@ -14,7 +14,7 @@ It is intended as a compact par2-like encoder/repair tool that produces linear-t
 * **High-Speed Performance:** Uses the optimized Wirehair library for linear-time erasure coding.
 * **Self-Describing Packets:** Every parity packet includes precise metadata containing a validation token and target block index.
 * **Resilient Architecture:** Mirrored headers — the primary header and hash-index are written at both the start and end of the archive to resist localized index corruption. Both copies are further protected by an XXH3-64 ECC checksum to detect silent corruption.
-* **Streamlined CLI:** Clean, distraction-free interface built specifically for creation (`-c`) and restoration (`-r`).
+* **Streamlined CLI:** Clean, distraction-free interface for creation (`-c`), restoration (`-r`), and supplementary add (`-a`).
 
 ---
 
@@ -23,7 +23,7 @@ It is intended as a compact par2-like encoder/repair tool that produces linear-t
 | | whpar | PAR2 (par2j64 / phpar2) |
 |---|---|---|
 | **Algorithm** | Fountain code (Wirehair) — **O(n)** linear time | Reed-Solomon — **O(n²)** quadratic time |
-| **Archive format** | Single `.whpar` file | Split `.par2` + `.volNN+NN.par2` files |
+| **Archive format** | Single/multi `.whpar` files (supplemental chaining) | Split `.par2` + `.volNN+NN.par2` files |
 | **Hashing** | xxHash / XXH3\_64bit | CRC32 |
 | **Parallel encode** | Yes — multi-track interleaving | No |
 | **Block metadata** | Self-describing per-packet headers with payload hash + expected block hash | Centralized index only |
@@ -73,12 +73,55 @@ The compiled binary will be located at `build\Release\whpar.exe`.
 
 ## 💻 Usage
 
-### Create a Parity Archive
-Generate a `.whpar` file to protect a source file with a specified percentage of overhead.
+### Quick Reference
 
 ```bash
-whpar -c <source_file> <parity_output.whpar> <overhead> [options]
+whpar -c <source> [<source>...] <overhead>  [options]   # create parity
+whpar -r <archive.whpar>                    [options]   # repair (auto-discovers supplements)
+whpar -a <archive.whpar> <overhead>                     # add supplementary parity
 ```
+
+### Create a Parity Archive
+Generate a `.whpar` file to protect one or more source files/directories with a specified percentage of overhead.
+
+```bash
+whpar -c <source> [<source>...] <overhead> [-o <output>] [options]
+```
+
+#### Multiple sources and directory prefixing
+
+When you pass more than one source argument to `-c`, all files from directory sources are prefixed with the directory's basename in the archive manifest. This prevents filename collisions during restore.
+
+- **Single source, single file:** `whpar -c data.iso 0.10` — manifest lists `data.iso`
+- **Single source, directory:** `whpar -c docs/ 0.10` — manifest lists `report.txt`, `subdir/file.pdf`
+- **Multiple sources:** `whpar -c data.iso docs/ 0.10` — manifest lists `data.iso`, `docs/report.txt`, `docs/subdir/file.pdf`
+
+When restoring a multi-source archive, output must be a directory. Files are placed relative to that directory matching their manifest paths:
+
+```bash
+whpar -r archive.p10.whpar -o restored/
+# → restored/data.iso
+# → restored/docs/report.txt
+# → restored/docs/subdir/file.pdf
+```
+
+To avoid the prefix, run separate `-c` commands — each source gets its own `.whpar` archive without any prefixing.
+
+#### Naming scheme
+
+Primary archives follow the pattern `<name>.pNN.whpar`, where **N** is the overhead percentage (integer). For example, 10% overhead produces `.p10.whpar`. Supplemental archives use `<name>.pNN+MM.whpar` — the first number is the cumulative base of the source archive, the second is what this supplement adds.
+
+- **No -o flag** — the archive is auto-named after the first source file:
+  - `whpar -c movie.mkv 0.10` → creates `movie.p10.whpar`
+  - `whpar -c photos.tar.gz 0.05` → creates `photos.tar.p05.whpar`
+- **-o flag** — the given name gets `.pN.whpar` appended (strips `.whpar` if present):
+  - `whpar -c data.iso 0.10 -o mybackup` → creates `mybackup.p10.whpar`
+  - `whpar -c data.iso 0.10 -o backup.whpar` → creates `backup.p10.whpar`
+- **Supplementary files** follow the cumulative convention:
+  - `whpar -a archive.p10.whpar 0.05` → creates `archive.p10+05.whpar`
+  - `whpar -a archive.p10+05.whpar 0.03` → creates `archive.p15+03.whpar`
+
+The **pNN** value is the *cumulative* overhead of the archive being supplemented, and **+MM** is what this supplement adds. Repair auto-discovers all `.whpar` files with a matching base name.
 
 | Option | Description |
 |---|---|
@@ -89,11 +132,11 @@ whpar -c <source_file> <parity_output.whpar> <overhead> [options]
 | `-f, --force` | Overwrite existing output without prompting. |
 | `--debug` | Enable debug output during encoding. |
 
-* **Example (10% overhead):** `whpar -c data.iso data.whpar 0.10`
-* **Example (8 parallel tracks, 1 MB blocks):** `whpar -c data.iso data.whpar 0.10 -j 8 -b 1M`
+* **Example (10% overhead):** `whpar -c data.iso 0.10` → `data.p10.whpar`
+* **Example (8 parallel tracks, custom output):** `whpar -c data.iso 0.10 -o myarchive -j 8` → `myarchive.p10.whpar`
 
 ### Repair a Damaged File
-Recover a corrupted file using your previously generated parity archive.
+Recover a corrupted file using a parity archive. Repair **auto-discovers all supplemental archives** in the same directory with a matching base name — keep the primary and all supplements together.
 
 ```bash
 whpar -r <parity.whpar> [-o <outpath>] [-f] [--debug] [--timing]
@@ -108,6 +151,71 @@ whpar -r <parity.whpar> [-o <outpath>] [-f] [--debug] [--timing]
 
 * **Example:** `whpar -r .\project.whpar -o C:\restore\out -f`
 * **Example (with timing):** `whpar -r .\project.whpar --timing`
+
+#### When repair fails
+
+If the parity archives don't have enough packets to recover the data, whpar tells you exactly what's missing:
+
+```
+FAILURE: Repair incomplete. Have 2341 data blocks, 320 parity packets.
+         Need ~51 more packets (≈2.2% additional overhead).
+```
+
+Repair auto-discovers all supplemental `.whpar` files in the same directory as the primary archive. If more packets are needed, create a new supplement with the shortfall (or more) using `-a`, then re-run repair with all archives present.
+
+### Add Supplementary Parity
+
+Generate additional parity for an existing archive without re-creating the whole thing. This is useful when:
+- A repair attempt failed with "Need ~X more packets" — generate a supplement with that shortfall
+- You want to distribute incremental parity later (e.g., user A has the source + original archive, user B needs more recovery packets without re-downloading everything)
+
+```bash
+whpar -a <archive.whpar> <overhead>
+```
+
+`-a` reads an existing `.whpar`, generates **only the requested overhead** in new parity packets, and writes a new supplemental file. The original archive is never modified.
+
+| Example | What happens |
+|---|---|
+| `whpar -c data.iso 0.10` | Creates `data.p10.whpar` (primary, 10%) |
+| `whpar -a data.p10.whpar 0.05` | Creates `data.p10+05.whpar` (supplement, adds 5%) |
+| `whpar -a data.p10+05.whpar 0.03` | Creates `data.p15+03.whpar` (another supplement, adds 3% to cumulative 15% base) |
+
+**Workflow example — two users:**
+
+```bash
+# ── User A: creates source + primary archive ──
+whpar -c photos.tar.gz 0.10
+# → photos.p10.whpar (10% overhead)
+
+# User B downloads source + photos.p10.whpar
+# Source gets damaged, repair fails with 10%
+whpar -r photos.p10.whpar
+# → FAILURE: Need ~200 more packets (≈16% additional overhead)
+
+# User B contacts User A to provide more parity
+
+# ── User A: generates supplement (needs original source) ──
+whpar -a photos.p10.whpar 0.20
+# → photos.p10+20.whpar (supplement adding 20%)
+
+# User A sends only the .whpar file (much smaller than source)
+
+# ── User B: now has 3 files ──
+#   photos.tar.gz (damaged)
+#   photos.p10.whpar (primary, 10%)
+#   photos.p10+20.whpar (supplement, +20%)
+
+# Repair auto-discovers both archives
+whpar -r photos.p10.whpar -o restored/
+# → Full recovery from aggregated packets
+```
+
+**Key points:**
+- The supplement only contains the *additional* parity packets, not a full re-encode
+- The original archive and all supplements must be kept together in the same directory — repair auto-discovers them by base name
+- Each supplement is a fully self-contained archive with duplicate headers, but generates no redundant parity
+- Supplements can be chained indefinitely: `p10` → `p10+05` → `p15+03` → `p18+10` → ...
 
 ---
 
