@@ -13,6 +13,7 @@ build/
 *.zip
 *.rar
 *.bin
+*.dat
 *.whpar
 par2j64.exe
 
