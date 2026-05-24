@@ -26,6 +26,8 @@ It is intended as a compact par2-like encoder/repair tool that produces linear-t
 | **Archive format** | Single/multi `.whpar` files (supplemental chaining) | Split `.par2` + `.volNN+NN.par2` files |
 | **Hashing** | xxHash / XXH3\_64bit | CRC32 |
 | **Parallel encode** | Yes — multi-track interleaving | No |
+| **Multi-file/folder** | Native support for multiple directories and multiple source files in a single archive | depends on client |
+| **Header resilience** | Redundant header/footer with XXH3-64 ECC protecting file/folder manifest | Centralized index, single point of failure |
 | **Block metadata** | Self-describing per-packet headers with payload hash + expected block hash | Centralized index only |
 
 PAR2's Reed-Solomon implementation must solve a full matrix inversion for every block — time scales quadratically with block count. For large files with thousands of blocks this becomes extremely slow.
@@ -44,7 +46,7 @@ The result: whpar creates parity and repairs damaged files **many times faster**
 | **Parity size** | 5121 MB | 5121 MB | 5120.6 MB | ≈ identical |
 | **Verify** | PASS | PASS | PASS | — |
 
-whpar creates parity ~3.5× faster and repairs ~3.7× faster than par2j64. Parity size is essentially the same at the same overhead percentage. XXH3-64 mode adds a small additional speed advantage over the default XXH32.
+whpar creates parity ~3.5× faster and repairs ~3.7× faster than par2j64. Parity size is essentially the same at the same overhead percentage. XXH3-64 mode adds a small additional speed advantage over the default XXH32 (on very large data sets).
 
 ---
 
