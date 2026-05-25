@@ -33,6 +33,7 @@ static void printUsage() {
     std::cout << "  Repair:  whpar -r <archive.whpar> [-o <outdir>] [-j <numJobs>] [--max-mem <size>] [-f] [--debug] [--timing]\n";
     std::cout << "  Add:     whpar -a <archive.whpar> <overhead>        [-j <numJobs>] [--max-mem <size>] [-f] [--debug]\n";
     std::cout << "  Info:    whpar -i <archive.whpar> [-o <dir>]                 [--debug]\n";
+    std::cout << "  List:    whpar -l <archive.whpar>                                    \n";
     std::cout << "\n";
     std::cout << "  Default: whpar <archive.whpar>  is equivalent to whpar -i <archive.whpar>\n\n";
     std::cout << "Options:\n";
@@ -45,6 +46,7 @@ static void printUsage() {
     std::cout << "                     Requires original source files; output: <base>.p<old>+<add>.whpar\n";
     std::cout << "  -i <archive.whpar> Inspect a parity archive: check all source files against hashes,\n";
     std::cout << "                     report corruption status, and optionally start repair\n";
+    std::cout << "  -l <archive.whpar> List archive manifest: file names, sizes, timestamps (no source I/O)\n";
     std::cout << "  -o <output>        Output path for create or repair\n";
     std::cout << "  -b <sizeKB>        Block size in KB (e.g. 64, 1M, 4G). Default: auto\n";
     std::cout << "  -j <numJobs>       Parallel tracks (create/add) or concurrent decoders (repair). Default: CPU cores\n";
@@ -62,6 +64,7 @@ static void printUsage() {
     std::cout << "  whpar -r archive.whpar -o restored/\n";
     std::cout << "  whpar -a backup.p10.whpar 0.05   # creates backup.p10+05.whpar\n";
     std::cout << "  whpar -r backup.p10.whpar -o ./   # auto-uses backup.p10+05.whpar\n";
+    std::cout << "  whpar -l archive.whpar             # list archive manifest (no source I/O)\n";
     std::cout << "  whpar -i archive.whpar             # check source files against archive\n";
 }
 
@@ -449,6 +452,20 @@ int main(int argc, char* argv[]) {
         }
 
         AddParity(archivePath, additionalOverhead, debug, force, numJobs, false, maxMemBytes);
+    }
+    else if (mode == "-l" || mode == "--list") {
+        std::string archivePath;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (archivePath.empty()) archivePath = a;
+            else { std::cerr << "Error: Unexpected argument: " << a << "\n"; return 1; }
+        }
+        if (archivePath.empty()) {
+            std::cerr << "Error: Missing archive path for list mode.\n";
+            std::cerr << "Usage: whpar -l <archive.whpar>\n";
+            return 1;
+        }
+        ListManifest(archivePath);
     }
     else if (mode == "-i" || mode == "--info") {
         std::string archivePath;

@@ -27,6 +27,7 @@
     POSSIBILITY OF SUCH DAMAGE.
 */
 
+#include <cstdio>
 #include "WirehairCodec.h"
 
 
@@ -4340,7 +4341,6 @@ WirehairResult Codec::DecodeFeed(
     if (_all_original) {
         // Check input:
         if (!IsAllOriginalData()) {
-            // Application violated precondition that all inputs must be unique
             CAT_DEBUG_BREAK();
             _all_original = false;
             return Wirehair_InvalidInput;

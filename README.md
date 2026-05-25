@@ -82,6 +82,7 @@ whpar -c <source> [<source>...] <overhead>  [options]   # create parity
 whpar -r <archive.whpar>                    [options]   # repair (auto-discovers supplements)
 whpar -a <archive.whpar> <overhead>                     # add supplementary parity
 whpar -i <archive.whpar>                    [options]   # inspect archive health
+whpar -l <archive.whpar>                                # list archive manifest
 ```
 
 ### Create a Parity Archive
@@ -140,6 +141,18 @@ The **pNN** value is the *cumulative* overhead of the archive being supplemented
 
 * **Example (10% overhead):** `whpar -c data.iso 0.10` → `data.p10.whpar`
 * **Example (8 parallel tracks, custom output):** `whpar -c data.iso 0.10 -o myarchive -j 8` → `myarchive.p10.whpar`
+
+### List Archive Contents
+
+Print the manifest of a `.whpar` archive — file names, sizes, and timestamps — without reading any source files.
+
+```bash
+whpar -l <archive.whpar>
+```
+
+Unlike `-i`, this mode performs no hashing or source I/O. It reads only the archive headers.
+
+* **Example:** `whpar -l archive.p10.whpar` → lists all files stored in the archive
 
 ### Inspect Archive Health
 

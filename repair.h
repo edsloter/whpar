@@ -22,3 +22,5 @@
 void RepairDataset(const std::string& damagedPath, const std::string& parityPath, const std::string& outputPath, bool force = false, bool debug = false, bool showTiming = false, uint32_t numJobs = 0, uint64_t maxMemBytes = 0);
 
 void InfoCheck(const std::string& parityPath, bool debug = false, const std::string& sourceDir = "");
+
+void ListManifest(const std::string& parityPath);

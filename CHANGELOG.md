@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.0.4 — 2026-05-25
+
+### Added
+- 1-track fast paths for `-c` and `-a`: skip interleaving overhead when archive uses a single track.
+- Real-time per-track completion messages during repair — each track prints "decoded" as soon as it finishes.
+- Incremental verify output in `-i` mode: per-file corruption status printed inline during the analysis loop.
+- `-l`/`--list` mode: list archive manifest — file names, sizes, timestamps — without any source I/O.
+- `--max-mem` auto-tunes BATCH_SIZE in repair based on `maxMemBytes / perDecoder` instead of hardcoded 2/3.
+- mmap-based streaming output in repair (`MapWrite`+`memcpy`) for better write throughput.
+
+### Changed
+- `SetFileSize` and `MapWrite` added to `portability.h` for the mmap streaming output path.
+- `walkArchivePackets` and `scanSupplementArchives` extracted as template functions, replacing duplicated 80-line lambdas in RepairDataset and InfoCheck.
+
 ## 0.0.3 — 2026-05-24
 
 ### Added
