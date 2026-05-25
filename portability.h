@@ -210,6 +210,37 @@ inline void Unmap(Mapping& mm) {
 #endif
 }
 
+inline bool SetFileSize(FileHandle h, uint64_t size) {
+#ifdef _WIN32
+    LARGE_INTEGER li;
+    li.QuadPart = static_cast<LONGLONG>(size);
+    if (!SetFilePointerEx(h, li, NULL, FILE_BEGIN)) return false;
+    return SetEndOfFile(h) != 0;
+#else
+    return ::ftruncate(h, static_cast<off_t>(size)) == 0;
+#endif
+}
+
+inline bool MapWrite(FileHandle hFile, uint64_t fileSize, Mapping& mm) {
+#ifdef _WIN32
+    HANDLE hm = CreateFileMappingA(hFile, NULL, PAGE_READWRITE, 0, 0, NULL);
+    if (!hm) return false;
+    void* p = MapViewOfFile(hm, FILE_MAP_WRITE, 0, 0, 0);
+    if (!p) { CloseHandle(hm); return false; }
+    mm.data = p;
+    mm.hMap = hm;
+    mm.size = fileSize;
+    return true;
+#else
+    void* p = ::mmap(nullptr, fileSize, PROT_READ | PROT_WRITE, MAP_SHARED, hFile, 0);
+    if (p == MAP_FAILED) return false;
+    mm.data = p;
+    mm.size = fileSize;
+    mm.fd = -1; // caller manages the fd
+    return true;
+#endif
+}
+
 // --- System info ---
 
 inline uint64_t TotalMemoryMB() {

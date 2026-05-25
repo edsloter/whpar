@@ -31,36 +31,58 @@
 #include <future>
 #include <atomic>
 #include <chrono>
+#include <ctime>
 #include <thread>
 #include <mutex>
 #include <filesystem>
 #include "portability.h"
 
-void RepairDataset(const std::string& damagedPath, const std::string& parityPath, const std::string& outputPath, bool force, bool debug, bool showTiming, uint32_t numJobs, uint64_t maxMemBytes) {
-    auto startTime = std::chrono::steady_clock::now();
-    auto showElapsed = [&]() {
-        double e = elapsedSecsSince(startTime);
-        if (e >= 60.0) {
-            int m = static_cast<int>(e / 60);
-            std::cout << " (" << m << "m " << (e - m * 60) << "s)";
-        } else {
-            std::cout << " (" << e << "s)";
-        }
-    };
+// ── Shared helpers ──────────────────────────────
+
+struct ArchiveMapping {
+    os::Mapping mapping;
+    std::string path;
+};
+
+static void showElapsed(std::chrono::steady_clock::time_point start) {
+    double e = elapsedSecsSince(start);
+    if (e >= 60.0) {
+        int m = static_cast<int>(e / 60);
+        std::cout << " (" << m << "m " << (e - m * 60) << "s)";
+    } else {
+        std::cout << " (" << e << "s)";
+    }
+}
+
+struct ParsedArchive {
+    bool valid = false;
+    PacketHeader globalMeta;
+    std::vector<uint64_t> referenceHashes;
+    std::vector<ManifestEntry> canonicalManifest;
+    bool useXxh64 = false;
+    uint64_t totalBlocks = 0;
+    uint16_t totalTracks = 0;
+    uint64_t stripeCount = 1;
+    uint64_t blocksPerStripe = 0;
+    std::string archiveDir;
+    std::function<uint64_t(const uint8_t*, size_t)> hashBlock;
+    std::vector<uint64_t> trackSizes;
+};
+
+static ParsedArchive parseArchive(const std::string& parityPath) {
+    ParsedArchive result;
 
     std::ifstream parityIn(parityPath, std::ios::binary);
     if (!parityIn) {
         std::cerr << "Error: Cannot open parity file: " << parityPath << "\n";
-        showElapsed(); std::cerr << "\n";
-        return;
+        return result;
     }
 
     parityIn.seekg(0, std::ios::end);
     std::streampos fileSize = parityIn.tellg();
     if (fileSize < static_cast<std::streampos>(sizeof(uint64_t))) {
         std::cerr << "Error: Archive too small.\n";
-        showElapsed(); std::cerr << "\n";
-        return;
+        return result;
     }
     parityIn.seekg(-static_cast<std::streamoff>(sizeof(uint64_t)), std::ios::end);
     uint64_t headerBlockSize = 0;
@@ -68,14 +90,12 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
 
     if (headerBlockSize < sizeof(PacketHeader) || headerBlockSize > static_cast<uint64_t>(fileSize) - sizeof(uint64_t)) {
         std::cerr << "Error: Invalid header size in archive footer.\n";
-        showElapsed(); std::cerr << "\n";
-        return;
+        return result;
     }
     std::streampos headerEndOffset = fileSize - static_cast<std::streampos>(sizeof(uint64_t)) - static_cast<std::streampos>(headerBlockSize);
     if (headerEndOffset <= 0 || headerEndOffset >= fileSize - static_cast<std::streampos>(sizeof(uint64_t))) {
         std::cerr << "Error: Corrupt archive header offset.\n";
-        showElapsed(); std::cerr << "\n";
-        return;
+        return result;
     }
 
     auto readHeaderBlock = [&](std::streampos pos, PacketHeader& hdr, std::vector<uint64_t>& hashes, std::vector<ManifestEntry>& manifest) -> bool {
@@ -133,58 +153,245 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
         : false;
     if (mirrorOk) mirrorOk = verifyHeaderEcc(headerEndOffset, headerBlockSize);
 
-    PacketHeader globalMeta;
-    std::vector<uint64_t> referenceHashes;
-    std::vector<ManifestEntry> canonicalManifest;
-    bool useXxh64;
-
     if (mainOk && mirrorOk) {
         if (hashesA == hashesEnd) {
-            globalMeta = headerEnd;
-            referenceHashes = std::move(hashesEnd);
-            canonicalManifest = !manifestEnd.empty() ? std::move(manifestEnd) : std::move(manifestA);
+            result.globalMeta = headerEnd;
+            result.referenceHashes = std::move(hashesEnd);
+            result.canonicalManifest = !manifestEnd.empty() ? std::move(manifestEnd) : std::move(manifestA);
         } else {
             std::cerr << "Warning: mirrored header mismatch; using primary.\n";
-            globalMeta = headerA;
-            referenceHashes = std::move(hashesA);
-            canonicalManifest = std::move(manifestA);
+            result.globalMeta = headerA;
+            result.referenceHashes = std::move(hashesA);
+            result.canonicalManifest = std::move(manifestA);
         }
     } else if (mirrorOk) {
-        globalMeta = headerEnd;
-        referenceHashes = std::move(hashesEnd);
-        canonicalManifest = std::move(manifestEnd);
+        result.globalMeta = headerEnd;
+        result.referenceHashes = std::move(hashesEnd);
+        result.canonicalManifest = std::move(manifestEnd);
         std::cerr << "Warning: primary header corrupt; recovered from mirrored header.\n";
     } else if (mainOk) {
-        globalMeta = headerA;
-        referenceHashes = std::move(hashesA);
-        canonicalManifest = std::move(manifestA);
+        result.globalMeta = headerA;
+        result.referenceHashes = std::move(hashesA);
+        result.canonicalManifest = std::move(manifestA);
         std::cerr << "Warning: mirrored header missing or corrupt; using primary.\n";
     } else {
         std::cerr << "Error: Invalid or corrupt .whpar archive (both headers unusable)\n";
-        showElapsed(); std::cerr << "\n";
-        return;
+        return result;
     }
 
-    useXxh64 = (globalMeta.matrixTrack == 1);
-    auto hashBlock = [useXxh64](const uint8_t* data, size_t len) -> uint64_t {
+    result.useXxh64 = (result.globalMeta.matrixTrack == 1);
+    result.hashBlock = [useXxh64 = result.useXxh64](const uint8_t* data, size_t len) -> uint64_t {
         return useXxh64 ? XXH3_64bits(data, len) : XXH32(data, len, 0);
     };
 
-
     std::cout << "Valid archive metadata found!\n";
-    std::cout << "Target File Size: " << (globalMeta.originalFileSize / (1024 * 1024.0)) << " MiB\n";
-    std::cout << "Expected Blocks: " << referenceHashes.size() << " (" << (globalMeta.blockSize / 1024) << " KB each)\n";
+    std::cout << "Target File Size: " << (result.globalMeta.originalFileSize / (1024 * 1024.0)) << " MiB\n";
+    std::cout << "Expected Blocks: " << result.referenceHashes.size() << " (" << (result.globalMeta.blockSize / 1024) << " KB each)\n";
 
-    uint64_t totalBlocks = (globalMeta.originalFileSize + globalMeta.blockSize - 1) / globalMeta.blockSize;
-    uint16_t totalTracks = static_cast<uint16_t>(globalMeta.fountainId);
-    if (totalTracks == 0) totalTracks = 1;
+    result.totalBlocks = (result.globalMeta.originalFileSize + result.globalMeta.blockSize - 1) / result.globalMeta.blockSize;
+    result.totalTracks = static_cast<uint16_t>(result.globalMeta.fountainId);
+    if (result.totalTracks == 0) result.totalTracks = 1;
 
-    std::cout << "Interleaving Architecture: " << totalTracks << " parallel matrix track(s).\n";
+    std::cout << "Interleaving Architecture: " << result.totalTracks << " parallel matrix track(s).\n";
+
+    result.stripeCount = result.globalMeta.blockSequence;
+    result.blocksPerStripe = result.globalMeta.expectedBlockHash;
+    if (result.stripeCount == 0) result.stripeCount = 1;
+    if (result.blocksPerStripe == 0) result.blocksPerStripe = result.totalBlocks;
+    if (result.stripeCount > 1)
+        std::cout << "Stripe count: " << result.stripeCount << " (" << result.blocksPerStripe << " blocks/stripe)\n";
+
+    result.trackSizes.resize(result.totalTracks, 0);
+    for (uint64_t i = 0; i < result.totalBlocks; ++i) {
+        uint16_t trackId = i % result.totalTracks;
+        uint64_t offset = i * result.globalMeta.blockSize;
+        size_t currentBlockSize = (offset + result.globalMeta.blockSize <= result.globalMeta.originalFileSize) ? result.globalMeta.blockSize : (result.globalMeta.originalFileSize - offset);
+        result.trackSizes[trackId] += currentBlockSize;
+    }
+
+    result.archiveDir = std::filesystem::path(parityPath).parent_path().u8string();
+    if (result.archiveDir.empty()) result.archiveDir = ".";
+
+    result.valid = true;
+    return result;
+}
+
+static std::string resolveSourceFile(const ManifestEntry& entry, const std::string& searchDir, const std::string& archiveDir) {
+    auto rel = std::filesystem::path(entry.relPath);
+    std::filesystem::path cand1 = std::filesystem::path(searchDir) / rel;
+    if (std::filesystem::exists(cand1)) return cand1.string();
+    std::filesystem::path cand2 = std::filesystem::path(archiveDir) / rel;
+    if (std::filesystem::exists(cand2)) return cand2.string();
+    std::filesystem::path cand3 = std::filesystem::current_path() / rel;
+    if (std::filesystem::exists(cand3)) return cand3.string();
+    return "";
+}
+
+static std::vector<std::string> resolveAllSources(const std::vector<ManifestEntry>& manifest, const std::string& searchDir, const std::string& archiveDir) {
+    std::vector<std::string> paths;
+    for (auto& me : manifest) {
+        paths.push_back(resolveSourceFile(me, searchDir, archiveDir));
+    }
+    return paths;
+}
+
+template<typename OnPacket>
+static bool walkArchivePackets(const std::string& archPath, const ParsedArchive& archive, bool isPrimary,
+                               std::vector<ArchiveMapping>& archiveMappings, size_t& parityPacketsSeen,
+                               OnPacket&& onPacket) {
+    os::Mapping mapping;
+    if (!os::MapRead(archPath.c_str(), mapping)) {
+        if (isPrimary) std::cerr << "Error: Cannot memory-map parity file: " << archPath << "\n";
+        else std::cerr << "Warning: Cannot memory-map supplement: " << archPath << "\n";
+        return false;
+    }
+    const uint8_t* base = static_cast<const uint8_t*>(mapping.data);
+    uint64_t fileSz = mapping.size;
+
+    uint64_t hdrBlockSz = 0;
+    memcpy(&hdrBlockSz, base + fileSz - sizeof(uint64_t), sizeof(uint64_t));
+    hdrBlockSz = le_to_cpu64(hdrBlockSz);
+    if (hdrBlockSz < sizeof(PacketHeader)) {
+        if (!isPrimary) std::cerr << "Warning: Invalid supplement header size: " << archPath << "\n";
+        os::Unmap(mapping);
+        return false;
+    }
+    uint64_t dataStart = hdrBlockSz;
+    uint64_t mirrorOffset = fileSz - sizeof(uint64_t) - hdrBlockSz;
+    if (dataStart >= mirrorOffset) {
+        if (!isPrimary) std::cerr << "Warning: Corrupt supplement: " << archPath << "\n";
+        os::Unmap(mapping);
+        return false;
+    }
+    uint64_t dataSize = mirrorOffset - dataStart;
+    const uint8_t* dataPtr = base + dataStart;
+    size_t dataSz = static_cast<size_t>(dataSize);
+
+    size_t bufOff = 0;
+    while (bufOff + sizeof(PacketHeader) <= dataSz) {
+        PacketHeader pkt;
+        memcpy(&pkt, dataPtr + bufOff, sizeof(pkt));
+        pkt.magic = le_to_cpu32(pkt.magic);
+        pkt.originalFileSize = le_to_cpu64(pkt.originalFileSize);
+        pkt.blockSize = le_to_cpu32(pkt.blockSize);
+        pkt.matrixTrack = le_to_cpu16(pkt.matrixTrack);
+        pkt.fountainId = le_to_cpu32(pkt.fountainId);
+        pkt.payloadHash = le_to_cpu64(pkt.payloadHash);
+        pkt.blockSequence = le_to_cpu32(pkt.blockSequence);
+        pkt.expectedBlockHash = le_to_cpu64(pkt.expectedBlockHash);
+        bufOff += sizeof(PacketHeader);
+
+        if (pkt.magic == WHPAR_MAGIC) {
+            if (bufOff + sizeof(uint32_t) > dataSz) break;
+            uint32_t hashCount = le_to_cpu32(*reinterpret_cast<const uint32_t*>(dataPtr + bufOff));
+            bufOff += sizeof(uint32_t) + static_cast<size_t>(hashCount) * sizeof(uint64_t);
+            if (bufOff >= dataSz) break;
+            uint8_t hm = dataPtr[bufOff]; bufOff++;
+            if (hm) {
+                if (bufOff + sizeof(uint32_t) > dataSz) break;
+                uint32_t fc = le_to_cpu32(*reinterpret_cast<const uint32_t*>(dataPtr + bufOff));
+                bufOff += sizeof(uint32_t);
+                for (uint32_t i = 0; i < fc; ++i) {
+                    if (bufOff + sizeof(uint32_t) > dataSz) break;
+                    uint32_t plen = le_to_cpu32(*reinterpret_cast<const uint32_t*>(dataPtr + bufOff));
+                    bufOff += sizeof(uint32_t) + plen + sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t);
+                }
+            }
+            continue;
+        }
+
+        if (pkt.magic != WHPAR_PKT_MAGIC) {
+            bufOff += (pkt.blockSize > 0) ? static_cast<size_t>(pkt.blockSize) : 0;
+            parityPacketsSeen++;
+            continue;
+        }
+
+        if (pkt.matrixTrack >= archive.totalTracks || pkt.blockSize > 2 * 1024 * 1024) {
+            bufOff += static_cast<size_t>(pkt.blockSize);
+            continue;
+        }
+
+        if (bufOff + pkt.blockSize > dataSz) break;
+
+        uint32_t stripeIndex = (archive.stripeCount > 1) ? pkt.blockSequence : 0;
+        onPacket(pkt.matrixTrack, dataPtr + bufOff, pkt.blockSize, pkt.fountainId, pkt.blockSequence, pkt.payloadHash, pkt.expectedBlockHash, stripeIndex);
+        bufOff += pkt.blockSize;
+        parityPacketsSeen++;
+    }
+
+    archiveMappings.push_back({std::move(mapping), archPath});
+    return true;
+}
+
+template<typename OnPacket>
+static void scanSupplementArchives(const std::string& parityPath, const ParsedArchive& archive,
+                                   std::vector<ArchiveMapping>& archiveMappings, size_t& parityPacketsSeen,
+                                   OnPacket&& onPacket) {
+    auto archDir = std::filesystem::path(parityPath).parent_path();
+    if (archDir.empty()) archDir = ".";
+    std::string primaryFn = std::filesystem::path(parityPath).filename().string();
+    std::string baseName = primaryFn;
+    {
+        size_t extDot = baseName.rfind('.');
+        if (extDot != std::string::npos) baseName = baseName.substr(0, extDot);
+        size_t plusPos = baseName.find('+');
+        if (plusPos != std::string::npos) baseName = baseName.substr(0, plusPos);
+        size_t ppos = baseName.rfind(".p");
+        if (ppos != std::string::npos && ppos > 0) baseName = baseName.substr(0, ppos);
+    }
+    if (std::filesystem::is_directory(archDir)) {
+        for (auto& entry : std::filesystem::directory_iterator(archDir)) {
+            if (!std::filesystem::is_regular_file(entry.path())) continue;
+            std::string name = entry.path().filename().string();
+            if (name.size() < 7) continue;
+            std::string ext = name.substr(name.size() - 6);
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            if (ext != ".whpar") continue;
+            if (name.find(baseName) != 0) continue;
+            std::string absEntry = std::filesystem::absolute(entry.path()).u8string();
+            std::string absPrimary = std::filesystem::absolute(parityPath).u8string();
+            if (absEntry == absPrimary) continue;
+            size_t plusPos = name.find('+');
+            if (plusPos == std::string::npos) continue;
+            if (plusPos >= name.size() - 1) continue;
+            std::cout << "Found supplemental archive: " << name << "\n";
+            if (!walkArchivePackets(entry.path().u8string(), archive, false, archiveMappings, parityPacketsSeen, onPacket))
+                std::cout << "  Warning: Failed to parse supplement '" << name << "' - skipping.\n";
+        }
+    }
+}
+
+struct FileOffsets {
+    std::vector<uint64_t> fileStartOffsets;
+    std::vector<uint64_t> fileEndOffsets;
+};
+
+static FileOffsets computeFileOffsets(const std::vector<ManifestEntry>& manifest) {
+    FileOffsets fo;
+    uint64_t off = 0;
+    for (auto& me : manifest) {
+        fo.fileStartOffsets.push_back(off);
+        off += me.fileSize;
+        fo.fileEndOffsets.push_back(off);
+    }
+    return fo;
+}
+
+// ── RepairDataset ───────────────────────────────
+
+void RepairDataset(const std::string& damagedPath, const std::string& parityPath, const std::string& outputPath, bool force, bool debug, bool showTiming, uint32_t numJobs, uint64_t maxMemBytes) {
+    auto startTime = std::chrono::steady_clock::now();
+
+    ParsedArchive archive = parseArchive(parityPath);
+    if (!archive.valid) {
+        showElapsed(startTime); std::cerr << "\n";
+        return;
+    }
 
     {
         uint64_t sysMemMB = os::TotalMemoryMB();
-        if (sysMemMB > 0 && maxMemBytes == 0 && globalMeta.originalFileSize > sysMemMB * 1024ULL * 1024ULL) {
-            std::cout << "Warning: File size (" << (globalMeta.originalFileSize / (1024ULL * 1024 * 1024))
+        if (sysMemMB > 0 && maxMemBytes == 0 && archive.globalMeta.originalFileSize > sysMemMB * 1024ULL * 1024ULL) {
+            std::cout << "Warning: File size (" << (archive.globalMeta.originalFileSize / (1024ULL * 1024 * 1024))
                       << " GB) exceeds total system RAM (" << sysMemMB / 1024
                       << " GB) and --max-mem is not set.\n"
                       << "         Repair will need to hold the full recovered data in memory.\n"
@@ -192,42 +399,16 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
         }
     }
 
-    uint64_t stripeCount = globalMeta.blockSequence;
-    uint64_t blocksPerStripe = globalMeta.expectedBlockHash;
-    if (stripeCount == 0) stripeCount = 1;
-    if (blocksPerStripe == 0) blocksPerStripe = totalBlocks;
-    if (stripeCount > 1)
-        std::cout << "Stripe count: " << stripeCount << " (" << blocksPerStripe << " blocks/stripe)\n";
-
-    std::vector<uint64_t> trackSizes(totalTracks, 0);
-
-    for (uint64_t i = 0; i < totalBlocks; ++i) {
-        uint16_t trackId = i % totalTracks;
-        uint64_t offset = i * globalMeta.blockSize;
-        size_t currentBlockSize = (offset + globalMeta.blockSize <= globalMeta.originalFileSize) ? globalMeta.blockSize : (globalMeta.originalFileSize - offset);
-        trackSizes[trackId] += currentBlockSize;
-    }
-
-    std::string archiveDir = std::filesystem::path(parityPath).parent_path().u8string();
-    if (archiveDir.empty()) archiveDir = ".";
-
     std::string resolvedDamagedPath = damagedPath;
-    if (resolvedDamagedPath.empty() && !canonicalManifest.empty() && canonicalManifest.size() == 1) {
-        auto rel = std::filesystem::path(canonicalManifest[0].relPath);
-        std::filesystem::path cand1 = std::filesystem::path(outputPath) / rel;
-        std::filesystem::path cand2 = std::filesystem::path(archiveDir) / rel;
-        std::filesystem::path cand3 = std::filesystem::current_path() / rel;
-        if (std::filesystem::exists(cand1)) {
-            resolvedDamagedPath = cand1.string();
-            std::cout << "Found file matching manifest: " << resolvedDamagedPath << "\n";
-        } else if (std::filesystem::exists(cand2)) {
-            resolvedDamagedPath = cand2.string();
-            std::cout << "Found file matching manifest: " << resolvedDamagedPath << "\n";
-        } else if (std::filesystem::exists(cand3)) {
-            resolvedDamagedPath = cand3.string();
+    if (resolvedDamagedPath.empty() && archive.canonicalManifest.size() == 1) {
+        auto found = resolveSourceFile(archive.canonicalManifest[0], outputPath, archive.archiveDir);
+        if (!found.empty()) {
+            resolvedDamagedPath = found;
             std::cout << "Found file matching manifest: " << resolvedDamagedPath << "\n";
         }
     }
+
+    FileOffsets fo = computeFileOffsets(archive.canonicalManifest);
 
     struct HealthyBlockRef {
         uint32_t internalTrackBlockId;
@@ -237,44 +418,21 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
         uint64_t fileLocalOffset;
     };
 
-    std::vector<uint64_t> fileStartOffsets;
-    std::vector<uint64_t> fileEndOffsets;
-    {
-        uint64_t off = 0;
-        for (auto& me : canonicalManifest) {
-            fileStartOffsets.push_back(off);
-            off += me.fileSize;
-            fileEndOffsets.push_back(off);
-        }
-    }
-
-    auto resolveSourcePath = [&](int fileIdx) -> std::string {
-        if (fileIdx < 0 || fileIdx >= (int)canonicalManifest.size()) return "";
-        auto rel = std::filesystem::path(canonicalManifest[fileIdx].relPath);
-        std::filesystem::path cand1 = std::filesystem::path(outputPath) / rel;
-        if (std::filesystem::exists(cand1)) return cand1.string();
-        std::filesystem::path cand2 = std::filesystem::path(archiveDir) / rel;
-        if (std::filesystem::exists(cand2)) return cand2.string();
-        std::filesystem::path cand3 = std::filesystem::current_path() / rel;
-        if (std::filesystem::exists(cand3)) return cand3.string();
-        return "";
-    };
-
     auto readBlockFromFiles = [&](uint64_t offset, uint32_t size, std::vector<uint8_t>& buf, int& cachedFileIdx, os::FileHandle& cachedHandle) -> bool {
         int fileIdx = 0;
-        for (size_t f = 0; f < fileStartOffsets.size(); ++f) {
-            if (offset >= fileStartOffsets[f] && offset < fileEndOffsets[f]) { fileIdx = static_cast<int>(f); break; }
+        for (size_t f = 0; f < fo.fileStartOffsets.size(); ++f) {
+            if (offset >= fo.fileStartOffsets[f] && offset < fo.fileEndOffsets[f]) { fileIdx = static_cast<int>(f); break; }
         }
         if (fileIdx != cachedFileIdx) {
             if (cachedHandle != os::InvalidHandle()) os::Close(cachedHandle);
-            std::string fpath = resolveSourcePath(fileIdx);
+            std::string fpath = resolveSourceFile(archive.canonicalManifest[fileIdx], outputPath, archive.archiveDir);
             cachedHandle = fpath.empty() ? os::InvalidHandle() : os::OpenRead(fpath.c_str(), false);
             cachedFileIdx = fileIdx;
         }
         std::fill(buf.begin(), buf.end(), 0);
         if (cachedHandle == os::InvalidHandle()) return false;
-        uint64_t localOff = offset - fileStartOffsets[fileIdx];
-        uint64_t avail = fileEndOffsets[fileIdx] - offset;
+        uint64_t localOff = offset - fo.fileStartOffsets[fileIdx];
+        uint64_t avail = fo.fileEndOffsets[fileIdx] - offset;
         size_t firstPart = static_cast<size_t>(std::min<uint64_t>(avail, size));
         os::Seek(cachedHandle, static_cast<int64_t>(localOff), 0);
         uint32_t br = 0;
@@ -282,8 +440,8 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
         if (firstPart < size) {
             size_t secondPart = size - firstPart;
             int fileIdx2 = fileIdx + 1;
-            if (fileIdx2 < static_cast<int>(canonicalManifest.size())) {
-                std::string fpath2 = resolveSourcePath(fileIdx2);
+            if (fileIdx2 < static_cast<int>(archive.canonicalManifest.size())) {
+                std::string fpath2 = resolveSourceFile(archive.canonicalManifest[fileIdx2], outputPath, archive.archiveDir);
                 os::FileHandle h2 = fpath2.empty() ? os::InvalidHandle() : os::OpenRead(fpath2.c_str(), false);
                 if (h2 != os::InvalidHandle()) {
                     uint32_t br2 = 0;
@@ -298,7 +456,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
     uint64_t corruptedBlocksCount = 0;
     std::vector<uint64_t> damagedBlockHashes;
     std::vector<uint8_t> blockCorrupted;
-    std::vector<std::vector<HealthyBlockRef>> trackHealthyBlocks(totalTracks);
+    std::vector<std::vector<HealthyBlockRef>> trackHealthyBlocks(archive.totalTracks);
 
     double phase1HashTime = 0, injectHashTime = 0, decodeFeedTime = 0;
     uint64_t decodeFeedCalls = 0;
@@ -310,7 +468,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
     std::mutex fallbackMutex;
 
     if (!resolvedDamagedPath.empty()) {
-        Progress prog(totalBlocks, "Analysis");
+        Progress prog(archive.totalBlocks, "Analysis");
 
         bool mappingUsed = false;
         os::Mapping mapping;
@@ -320,24 +478,24 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
             fileData = static_cast<const uint8_t*>(mapping.data);
             if (fileData) {
                 mappingUsed = true;
-                damagedBlockHashes.resize(totalBlocks);
-                blockCorrupted.assign(totalBlocks, 0);
+                damagedBlockHashes.resize(archive.totalBlocks);
+                blockCorrupted.assign(archive.totalBlocks, 0);
 
                 auto tHashPhase1 = std::chrono::steady_clock::now();
                 {
                     unsigned int numThreads = std::thread::hardware_concurrency();
                     if (numThreads == 0) numThreads = 4;
-                    uint64_t chunkSize = (totalBlocks + numThreads - 1) / numThreads;
+                    uint64_t chunkSize = (archive.totalBlocks + numThreads - 1) / numThreads;
                     std::vector<std::future<void>> hashFutures;
-                    for (uint64_t b = 0; b < totalBlocks; b += chunkSize) {
-                        uint64_t end = (b + chunkSize > totalBlocks) ? totalBlocks : b + chunkSize;
+                    for (uint64_t b = 0; b < archive.totalBlocks; b += chunkSize) {
+                        uint64_t end = (b + chunkSize > archive.totalBlocks) ? archive.totalBlocks : b + chunkSize;
                         hashFutures.push_back(std::async(std::launch::async, [&, b, end]() {
                             for (uint64_t i = b; i < end; ++i) {
-                                uint64_t offset = i * globalMeta.blockSize;
-                                size_t currentBlockSize = (offset + globalMeta.blockSize <= globalMeta.originalFileSize)
-                                    ? globalMeta.blockSize
-                                    : (globalMeta.originalFileSize - offset);
-                                damagedBlockHashes[i] = hashBlock(fileData + offset, currentBlockSize);
+                                uint64_t offset = i * archive.globalMeta.blockSize;
+                                size_t currentBlockSize = (offset + archive.globalMeta.blockSize <= archive.globalMeta.originalFileSize)
+                                    ? archive.globalMeta.blockSize
+                                    : (archive.globalMeta.originalFileSize - offset);
+                                damagedBlockHashes[i] = archive.hashBlock(fileData + offset, currentBlockSize);
                                 prog.tick();
                             }
                         }));
@@ -346,14 +504,14 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                 }
                 phase1HashTime = elapsedSecsSince(tHashPhase1);
 
-                for (uint64_t i = 0; i < totalBlocks; ++i) {
-                    uint16_t trackId = i % totalTracks;
-                    uint64_t offset = i * globalMeta.blockSize;
-                    size_t currentBlockSize = (offset + globalMeta.blockSize <= globalMeta.originalFileSize)
-                        ? globalMeta.blockSize : (globalMeta.originalFileSize - offset);
-                    uint64_t expectedHash = (i < referenceHashes.size()) ? referenceHashes[i] : 0;
+                for (uint64_t i = 0; i < archive.totalBlocks; ++i) {
+                    uint16_t trackId = i % archive.totalTracks;
+                    uint64_t offset = i * archive.globalMeta.blockSize;
+                    size_t currentBlockSize = (offset + archive.globalMeta.blockSize <= archive.globalMeta.originalFileSize)
+                        ? archive.globalMeta.blockSize : (archive.globalMeta.originalFileSize - offset);
+                    uint64_t expectedHash = (i < archive.referenceHashes.size()) ? archive.referenceHashes[i] : 0;
                     if (damagedBlockHashes[i] == expectedHash) {
-                        trackHealthyBlocks[trackId].push_back({static_cast<uint32_t>(i / totalTracks), offset, static_cast<uint32_t>(currentBlockSize), 0, offset});
+                        trackHealthyBlocks[trackId].push_back({static_cast<uint32_t>(i / archive.totalTracks), offset, static_cast<uint32_t>(currentBlockSize), 0, offset});
                     } else {
                         corruptedBlocksCount++;
                         blockCorrupted[i] = 1;
@@ -367,17 +525,17 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
         if (!mappingUsed) {
             std::ifstream damagedFile(resolvedDamagedPath, std::ios::binary);
             if (damagedFile.is_open()) {
-                std::vector<uint8_t> blockBuffer(globalMeta.blockSize);
-                blockCorrupted.assign(totalBlocks, 0);
-                for (uint64_t i = 0; i < totalBlocks; ++i) {
-                    damagedFile.read(reinterpret_cast<char*>(blockBuffer.data()), globalMeta.blockSize);
+                std::vector<uint8_t> blockBuffer(archive.globalMeta.blockSize);
+                blockCorrupted.assign(archive.totalBlocks, 0);
+                for (uint64_t i = 0; i < archive.totalBlocks; ++i) {
+                    damagedFile.read(reinterpret_cast<char*>(blockBuffer.data()), archive.globalMeta.blockSize);
                     size_t bytesRead = damagedFile.gcount();
-                    uint64_t calculatedHash = hashBlock(blockBuffer.data(), bytesRead);
+                    uint64_t calculatedHash = archive.hashBlock(blockBuffer.data(), bytesRead);
                     prog.tick();
-                    uint16_t trackId = i % totalTracks;
-                    uint64_t expectedHash = (i < referenceHashes.size()) ? referenceHashes[i] : 0;
+                    uint16_t trackId = i % archive.totalTracks;
+                    uint64_t expectedHash = (i < archive.referenceHashes.size()) ? archive.referenceHashes[i] : 0;
                     if (calculatedHash == expectedHash) {
-                        trackHealthyBlocks[trackId].push_back({static_cast<uint32_t>(i / totalTracks), i * globalMeta.blockSize, static_cast<uint32_t>(bytesRead), 0, i * globalMeta.blockSize});
+                        trackHealthyBlocks[trackId].push_back({static_cast<uint32_t>(i / archive.totalTracks), i * archive.globalMeta.blockSize, static_cast<uint32_t>(bytesRead), 0, i * archive.globalMeta.blockSize});
                     } else {
                         corruptedBlocksCount++;
                         blockCorrupted[i] = 1;
@@ -389,30 +547,30 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
 
         prog.done();
         std::cout << "Found and isolated " << corruptedBlocksCount << " corrupted block(s).\n";
-    } else if (!canonicalManifest.empty()) {
-        blockCorrupted.assign(totalBlocks, 0);
+    } else if (!archive.canonicalManifest.empty()) {
+        blockCorrupted.assign(archive.totalBlocks, 0);
         std::cout << "Analyzing local files for healthy blocks...\n";
         corruptedBlocksCount = 0;
 
-        Progress prog(totalBlocks, "Analysis");
+        Progress prog(archive.totalBlocks, "Analysis");
         auto tHashPhase1 = std::chrono::steady_clock::now();
-        std::vector<uint8_t> composeBuf(globalMeta.blockSize);
+        std::vector<uint8_t> composeBuf(archive.globalMeta.blockSize);
         int curFileIdx = -1;
         os::FileHandle hCurFile = os::InvalidHandle();
 
-        for (uint64_t i = 0; i < totalBlocks; ++i) {
-            uint64_t offset = i * globalMeta.blockSize;
-            size_t currentBlockSize = (offset + globalMeta.blockSize <= globalMeta.originalFileSize)
-                ? globalMeta.blockSize : (globalMeta.originalFileSize - offset);
+        for (uint64_t i = 0; i < archive.totalBlocks; ++i) {
+            uint64_t offset = i * archive.globalMeta.blockSize;
+            size_t currentBlockSize = (offset + archive.globalMeta.blockSize <= archive.globalMeta.originalFileSize)
+                ? archive.globalMeta.blockSize : (archive.globalMeta.originalFileSize - offset);
 
             readBlockFromFiles(offset, static_cast<uint32_t>(currentBlockSize), composeBuf, curFileIdx, hCurFile);
 
-            uint64_t h = hashBlock(composeBuf.data(), currentBlockSize);
+            uint64_t h = archive.hashBlock(composeBuf.data(), currentBlockSize);
             prog.tick();
-            uint16_t trackId = i % totalTracks;
-            uint64_t expectedHash = (i < referenceHashes.size()) ? referenceHashes[i] : 0;
+            uint16_t trackId = i % archive.totalTracks;
+            uint64_t expectedHash = (i < archive.referenceHashes.size()) ? archive.referenceHashes[i] : 0;
             if (h == expectedHash) {
-                trackHealthyBlocks[trackId].push_back({static_cast<uint32_t>(i / totalTracks), offset, static_cast<uint32_t>(currentBlockSize), 0, offset});
+                trackHealthyBlocks[trackId].push_back({static_cast<uint32_t>(i / archive.totalTracks), offset, static_cast<uint32_t>(currentBlockSize), 0, offset});
             } else {
                 corruptedBlocksCount++;
                 blockCorrupted[i] = 1;
@@ -426,18 +584,16 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
     }
 
     if (corruptedBlocksCount == 0) {
-        parityIn.close();
         if (!resolvedDamagedPath.empty()) {
             std::cout << "No corruption detected; file is intact.\n";
         } else {
             std::cout << "No corruption detected.\n";
         }
         std::cout << "File is already intact.";
-        showElapsed(); std::cout << "\n";
+        showElapsed(startTime); std::cout << "\n";
         return;
     }
 
-    parityIn.close();
     std::cout << "Injecting parity packets...\n";
 
     // ── Parse parity packets from primary + supplemental archives ──
@@ -450,155 +606,25 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
         uint64_t expectedBlockHash;
         uint32_t stripeIndex;
     };
-    std::vector<std::vector<ParsedPacket>> trackPackets(totalTracks);
+    std::vector<std::vector<ParsedPacket>> trackPackets(archive.totalTracks);
     size_t parityPacketsSeen = 0;
 
-    struct ArchiveMapping {
-        os::Mapping mapping;
-        std::string path;
-    };
     std::vector<ArchiveMapping> archiveMappings;
 
-    auto parsePacketsFromArchive = [&](const std::string& archPath, bool isPrimary) -> bool {
-        os::Mapping mapping;
-        if (!os::MapRead(archPath.c_str(), mapping)) {
-            if (isPrimary) std::cerr << "Error: Cannot memory-map parity file: " << archPath << "\n";
-            else std::cerr << "Warning: Cannot memory-map supplement: " << archPath << "\n";
-            return false;
-        }
-        const uint8_t* base = static_cast<const uint8_t*>(mapping.data);
-        uint64_t fileSz = mapping.size;
-
-        // Find the data section (between the two headers)
-        uint64_t hdrBlockSz = 0;
-        // Read footer to get header block size
-        memcpy(&hdrBlockSz, base + fileSz - sizeof(uint64_t), sizeof(uint64_t));
-        hdrBlockSz = le_to_cpu64(hdrBlockSz);
-        if (hdrBlockSz < sizeof(PacketHeader)) {
-            if (!isPrimary) std::cerr << "Warning: Invalid supplement header size: " << archPath << "\n";
-            os::Unmap(mapping);
-            return false;
-        }
-        uint64_t dataStart = hdrBlockSz;
-        uint64_t mirrorOffset = fileSz - sizeof(uint64_t) - hdrBlockSz;
-        if (dataStart >= mirrorOffset) {
-            if (!isPrimary) std::cerr << "Warning: Corrupt supplement: " << archPath << "\n";
-            os::Unmap(mapping);
-            return false;
-        }
-        uint64_t dataSize = mirrorOffset - dataStart;
-
-        const uint8_t* dataPtr = base + dataStart;
-        size_t dataSz = static_cast<size_t>(dataSize);
-
-        size_t bufOff = 0;
-        while (bufOff + sizeof(PacketHeader) <= dataSz) {
-            PacketHeader pkt;
-            memcpy(&pkt, dataPtr + bufOff, sizeof(pkt));
-            pkt.magic = le_to_cpu32(pkt.magic);
-            pkt.originalFileSize = le_to_cpu64(pkt.originalFileSize);
-            pkt.blockSize = le_to_cpu32(pkt.blockSize);
-            pkt.matrixTrack = le_to_cpu16(pkt.matrixTrack);
-            pkt.fountainId = le_to_cpu32(pkt.fountainId);
-            pkt.payloadHash = le_to_cpu64(pkt.payloadHash);
-            pkt.blockSequence = le_to_cpu32(pkt.blockSequence);
-            pkt.expectedBlockHash = le_to_cpu64(pkt.expectedBlockHash);
-            bufOff += sizeof(PacketHeader);
-
-            if (pkt.magic == WHPAR_MAGIC) {
-                if (bufOff + sizeof(uint32_t) > dataSz) break;
-                uint32_t hashCount = le_to_cpu32(*reinterpret_cast<const uint32_t*>(dataPtr + bufOff));
-                bufOff += sizeof(uint32_t) + static_cast<size_t>(hashCount) * sizeof(uint64_t);
-                if (bufOff >= dataSz) break;
-                uint8_t hm = dataPtr[bufOff]; bufOff++;
-                if (hm) {
-                    if (bufOff + sizeof(uint32_t) > dataSz) break;
-                    uint32_t fc = le_to_cpu32(*reinterpret_cast<const uint32_t*>(dataPtr + bufOff));
-                    bufOff += sizeof(uint32_t);
-                    for (uint32_t i = 0; i < fc; ++i) {
-                        if (bufOff + sizeof(uint32_t) > dataSz) break;
-                        uint32_t plen = le_to_cpu32(*reinterpret_cast<const uint32_t*>(dataPtr + bufOff));
-                        bufOff += sizeof(uint32_t) + plen + sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t);
-                    }
-                }
-                continue;
-            }
-
-            if (pkt.magic != WHPAR_PKT_MAGIC) {
-                bufOff += (pkt.blockSize > 0) ? static_cast<size_t>(pkt.blockSize) : 0;
-                parityPacketsSeen++;
-                continue;
-            }
-
-            if (pkt.matrixTrack >= totalTracks || pkt.blockSize > 2 * 1024 * 1024) {
-                bufOff += static_cast<size_t>(pkt.blockSize);
-                continue;
-            }
-
-            if (bufOff + pkt.blockSize > dataSz) break;
-
-            {   uint32_t si = (stripeCount > 1) ? pkt.blockSequence : 0;
-                trackPackets[pkt.matrixTrack].push_back({pkt.fountainId, dataPtr + bufOff, pkt.blockSize, pkt.blockSequence, pkt.payloadHash, pkt.expectedBlockHash, si});
-            }
-            bufOff += pkt.blockSize;
-            parityPacketsSeen++;
-        }
-
-        archiveMappings.push_back({std::move(mapping), archPath});
-        return true;
+    auto onPacket = [&](uint16_t track, const uint8_t* payload, uint32_t payloadSize,
+                        uint32_t fountainId, uint32_t blockSequence,
+                        uint64_t payloadHash, uint64_t expectedBlockHash, uint32_t stripeIndex) {
+        trackPackets[track].push_back({fountainId, payload, payloadSize, blockSequence, payloadHash, expectedBlockHash, stripeIndex});
     };
 
-    // Parse primary archive
-    parsePacketsFromArchive(parityPath, true);
-
-    // Scan for supplemental archives (basename.pNN+NN.whpar)
-    {
-        auto archDir = std::filesystem::path(parityPath).parent_path();
-        if (archDir.empty()) archDir = ".";
-        std::string primaryFn = std::filesystem::path(parityPath).filename().string();
-        // Derive base name: strip .pNN+NN.whpar or .pNN.whpar
-        std::string baseName = primaryFn;
-        {
-            size_t extDot = baseName.rfind('.');
-            if (extDot != std::string::npos) baseName = baseName.substr(0, extDot);
-            // Remove supplemental suffix if present
-            size_t plusPos = baseName.find('+');
-            if (plusPos != std::string::npos) baseName = baseName.substr(0, plusPos);
-            // Remove .pNN
-            size_t ppos = baseName.rfind(".p");
-            if (ppos != std::string::npos && ppos > 0) baseName = baseName.substr(0, ppos);
-        }
-
-        if (std::filesystem::is_directory(archDir)) {
-            for (auto& entry : std::filesystem::directory_iterator(archDir)) {
-                if (!std::filesystem::is_regular_file(entry.path())) continue;
-                std::string name = entry.path().filename().string();
-                // Must end with .whpar, start with baseName, and not be the primary
-                if (name.size() < 7) continue;
-                std::string ext = name.substr(name.size() - 6);
-                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-                if (ext != ".whpar") continue;
-                if (name.find(baseName) != 0) continue;
-                // Canonicalize paths to compare
-                std::string absEntry = std::filesystem::absolute(entry.path()).u8string();
-                std::string absPrimary = std::filesystem::absolute(parityPath).u8string();
-                if (absEntry == absPrimary) continue;
-
-                size_t plusPos = name.find('+');
-                if (plusPos == std::string::npos) continue; // only scan supplements (have + in name)
-                if (plusPos >= name.size() - 1) continue;
-
-                std::cout << "Found supplemental archive: " << name << "\n";
-                parsePacketsFromArchive(entry.path().u8string(), false);
-            }
-        }
-    }
+    walkArchivePackets(parityPath, archive, true, archiveMappings, parityPacketsSeen, onPacket);
+    scanSupplementArchives(parityPath, archive, archiveMappings, parityPacketsSeen, onPacket);
 
     auto tInjectHash = std::chrono::steady_clock::now();
-    std::vector<std::vector<uint8_t>> trackPacketValid(totalTracks);
+    std::vector<std::vector<uint8_t>> trackPacketValid(archive.totalTracks);
     {
         size_t totalParityPackets = 0;
-        for (uint16_t t = 0; t < totalTracks; ++t) {
+        for (uint16_t t = 0; t < archive.totalTracks; ++t) {
             trackPacketValid[t].resize(trackPackets[t].size(), false);
             totalParityPackets += trackPackets[t].size();
         }
@@ -609,7 +635,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
         struct PacketRef { uint16_t track; size_t idx; const uint8_t* data; uint32_t size; uint64_t expectedHash; };
         std::vector<PacketRef> allRefs;
         allRefs.reserve(totalParityPackets);
-        for (uint16_t t = 0; t < totalTracks; ++t) {
+        for (uint16_t t = 0; t < archive.totalTracks; ++t) {
             for (size_t i = 0; i < trackPackets[t].size(); ++i) {
                 auto& pp = trackPackets[t][i];
                 allRefs.push_back({t, i, pp.payload, pp.payloadSize, pp.payloadHash});
@@ -623,7 +649,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
             hashFutures.push_back(std::async(std::launch::async, [&, b, end]() {
                 for (uint64_t i = b; i < end; ++i) {
                     auto& ref = allRefs[i];
-                    trackPacketValid[ref.track][ref.idx] = (hashBlock(ref.data, ref.size) == ref.expectedHash);
+                    trackPacketValid[ref.track][ref.idx] = (archive.hashBlock(ref.data, ref.size) == ref.expectedHash);
                 }
             }));
         }
@@ -635,7 +661,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
 
     auto tDecodeFeed = std::chrono::steady_clock::now();
 
-    std::vector<std::vector<uint8_t>> recoveredTracks(totalTracks);
+    std::vector<std::vector<uint8_t>> recoveredTracks(archive.totalTracks);
     std::atomic<bool> executionSuccess{true};
     std::atomic<uint64_t> atomicDecodeCalls{0};
 
@@ -665,8 +691,8 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
 
     std::string outFile;
     bool inPlace = false;
-    if (!canonicalManifest.empty() && canonicalManifest.size() == 1) {
-        auto& me = canonicalManifest[0];
+    if (!archive.canonicalManifest.empty() && archive.canonicalManifest.size() == 1) {
+        auto& me = archive.canonicalManifest[0];
         std::filesystem::path outP(outputPath);
         if (std::filesystem::is_directory(outP) && !rejectPathTraversal(outP, me.relPath)) {
             std::cerr << "Error: manifest path '" << me.relPath << "' escapes output directory.\n";
@@ -682,18 +708,28 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
     unsigned int BATCH_SIZE = 2;
     if (numJobs > 0) {
         BATCH_SIZE = numJobs;
+    } else if (maxMemBytes > 0 && archive.totalTracks > 0) {
+        uint64_t perDecoder = archive.globalMeta.originalFileSize / archive.totalTracks + archive.globalMeta.blockSize;
+        perDecoder = std::max(perDecoder * 2, uint64_t(1024 * 1024));
+        if (archive.stripeCount > 1) {
+            uint64_t bpt = (archive.blocksPerStripe + archive.totalTracks - 1) / archive.totalTracks;
+            perDecoder = std::max(bpt * archive.globalMeta.blockSize * 3, uint64_t(1024 * 1024));
+        }
+        unsigned int m = static_cast<unsigned int>(maxMemBytes / perDecoder);
+        if (m > 0) BATCH_SIZE = m;
+        if (BATCH_SIZE < 1) BATCH_SIZE = 1;
     } else {
         uint64_t totalMemMB = os::TotalMemoryMB();
         if (totalMemMB > 0 && totalMemMB >= 40ULL * 1024) BATCH_SIZE = 3;
     }
-    if (BATCH_SIZE > totalTracks) BATCH_SIZE = totalTracks;
+    if (BATCH_SIZE > archive.totalTracks) BATCH_SIZE = archive.totalTracks;
 
     std::mutex writeMutex;
 
-    if (stripeCount <= 1) {
+    if (archive.stripeCount <= 1) {
         // ── Non-stripe decode (original behavior, unchanged) ──
-        for (uint16_t batchStart = 0; batchStart < totalTracks && executionSuccess; batchStart += BATCH_SIZE) {
-            uint16_t batchEnd = (batchStart + BATCH_SIZE < totalTracks) ? (batchStart + BATCH_SIZE) : totalTracks;
+        for (uint16_t batchStart = 0; batchStart < archive.totalTracks && executionSuccess; batchStart += BATCH_SIZE) {
+            uint16_t batchEnd = (batchStart + BATCH_SIZE < archive.totalTracks) ? (batchStart + BATCH_SIZE) : archive.totalTracks;
             std::vector<std::future<void>> futures;
 
             for (uint16_t t = batchStart; t < batchEnd; ++t) {
@@ -701,7 +737,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                           << trackPackets[t].size() << " parity packets\n";
 
                 futures.push_back(std::async(std::launch::async, [&, t]() {
-                    WirehairCodec dec = wirehair_decoder_create(nullptr, trackSizes[t], globalMeta.blockSize);
+                    WirehairCodec dec = wirehair_decoder_create(nullptr, archive.trackSizes[t], archive.globalMeta.blockSize);
                     if (!dec) {
                         std::cerr << "Failed to create decoder for track " << t << "\n";
                         executionSuccess = false;
@@ -710,7 +746,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
 
                     bool solved = false;
                     uint64_t localCalls = 0;
-                    std::vector<uint8_t> readBuf(globalMeta.blockSize);
+                    std::vector<uint8_t> readBuf(archive.globalMeta.blockSize);
                     int curFileIdx = -1;
                     os::FileHandle hMultiIn = os::InvalidHandle();
 
@@ -766,8 +802,8 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                         return;
                     }
 
-                    recoveredTracks[t].resize(trackSizes[t]);
-                    WirehairResult rr = wirehair_recover(dec, recoveredTracks[t].data(), trackSizes[t]);
+                    recoveredTracks[t].resize(archive.trackSizes[t]);
+                    WirehairResult rr = wirehair_recover(dec, recoveredTracks[t].data(), archive.trackSizes[t]);
                     wirehair_free(dec);
 
                     if (rr != Wirehair_Success) {
@@ -778,11 +814,11 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                         os::FileHandle hTrackOut = os::OpenReadWrite(resolvedDamagedPath.c_str());
                         if (hTrackOut != os::InvalidHandle()) {
                             size_t trackByteOffset = 0;
-                            for (uint64_t g = t; g < totalBlocks; g += totalTracks) {
-                                uint64_t fileOff = g * globalMeta.blockSize;
-                                size_t blockSz = (fileOff + globalMeta.blockSize <= globalMeta.originalFileSize)
-                                    ? globalMeta.blockSize
-                                    : (globalMeta.originalFileSize - fileOff);
+                            for (uint64_t g = t; g < archive.totalBlocks; g += archive.totalTracks) {
+                                uint64_t fileOff = g * archive.globalMeta.blockSize;
+                                size_t blockSz = (fileOff + archive.globalMeta.blockSize <= archive.globalMeta.originalFileSize)
+                                    ? archive.globalMeta.blockSize
+                                    : (archive.globalMeta.originalFileSize - fileOff);
                                 if (g < blockCorrupted.size() && blockCorrupted[g]) {
                                     if (!os::Seek(hTrackOut, static_cast<int64_t>(fileOff), 0)) {
                                         std::cerr << "Error: Seek failed during in-place write.\n";
@@ -802,6 +838,10 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                         recoveredTracks[t].clear();
                         recoveredTracks[t].shrink_to_fit();
                     }
+                    {
+                        std::lock_guard<std::mutex> lock(writeMutex);
+                        std::cout << "Track " << t << " decoded.\n";
+                    }
                 }));
             }
 
@@ -809,33 +849,34 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
         }
     } else {
         // ── Stripe decode ──
-        for (uint16_t t = 0; t < totalTracks; ++t)
-            recoveredTracks[t].resize(trackSizes[t]);
-        std::vector<size_t> trackWriteOffsets(totalTracks, 0);
+        for (uint16_t t = 0; t < archive.totalTracks; ++t)
+            recoveredTracks[t].resize(archive.trackSizes[t]);
+        std::vector<size_t> trackWriteOffsets(archive.totalTracks, 0);
+        std::vector<std::vector<uint64_t>> trackFailedStripes(archive.totalTracks);
 
-        for (uint64_t s = 0; s < stripeCount && executionSuccess; ++s) {
-            uint64_t stripeStartBlock = s * blocksPerStripe;
-            uint64_t stripeEndBlock = std::min(stripeStartBlock + blocksPerStripe, totalBlocks);
+        for (uint64_t s = 0; s < archive.stripeCount && executionSuccess; ++s) {
+            uint64_t stripeStartBlock = s * archive.blocksPerStripe;
+            uint64_t stripeEndBlock = std::min(stripeStartBlock + archive.blocksPerStripe, archive.totalBlocks);
 
             // Per-stripe per-track sizes
-            std::vector<uint64_t> stripeTrackSizes(totalTracks, 0);
+            std::vector<uint64_t> stripeTrackSizes(archive.totalTracks, 0);
             for (uint64_t i = stripeStartBlock; i < stripeEndBlock; ++i) {
-                uint16_t tid = static_cast<uint16_t>(i % totalTracks);
-                uint64_t off = i * globalMeta.blockSize;
-                size_t sz = (off + globalMeta.blockSize <= globalMeta.originalFileSize)
-                    ? globalMeta.blockSize : (globalMeta.originalFileSize - off);
+                uint16_t tid = static_cast<uint16_t>(i % archive.totalTracks);
+                uint64_t off = i * archive.globalMeta.blockSize;
+                size_t sz = (off + archive.globalMeta.blockSize <= archive.globalMeta.originalFileSize)
+                    ? archive.globalMeta.blockSize : (archive.globalMeta.originalFileSize - off);
                 stripeTrackSizes[tid] += sz;
             }
 
-            for (uint16_t batchStart = 0; batchStart < totalTracks && executionSuccess; batchStart += BATCH_SIZE) {
-                uint16_t batchEnd = (batchStart + BATCH_SIZE < totalTracks) ? (batchStart + BATCH_SIZE) : totalTracks;
+            for (uint16_t batchStart = 0; batchStart < archive.totalTracks && executionSuccess; batchStart += BATCH_SIZE) {
+                uint16_t batchEnd = (batchStart + BATCH_SIZE < archive.totalTracks) ? (batchStart + BATCH_SIZE) : archive.totalTracks;
                 std::vector<std::future<void>> futures;
 
                 for (uint16_t t = batchStart; t < batchEnd; ++t) {
                     if (stripeTrackSizes[t] == 0) continue;
                     uint64_t hCount = 0;
                     for (auto& ref : trackHealthyBlocks[t]) {
-                        uint64_t g = ref.internalTrackBlockId * totalTracks + t;
+                        uint64_t g = ref.internalTrackBlockId * archive.totalTracks + t;
                         if (g >= stripeStartBlock && g < stripeEndBlock) hCount++;
                     }
                     std::cout << "Stripe " << s << " Track " << t << ": " << hCount << " healthy blocks, "
@@ -843,7 +884,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
 
                     futures.push_back(std::async(std::launch::async, [&, t, s, stripeStartBlock, stripeEndBlock]() {
                         uint64_t stripeSize = stripeTrackSizes[t];
-                        WirehairCodec dec = wirehair_decoder_create(nullptr, stripeSize, globalMeta.blockSize);
+                        WirehairCodec dec = wirehair_decoder_create(nullptr, stripeSize, archive.globalMeta.blockSize);
                         if (!dec) {
                             std::cerr << "Failed to create decoder for stripe " << s << " track " << t << "\n";
                             executionSuccess = false;
@@ -852,7 +893,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
 
                         bool solved = false;
                         uint64_t localCalls = 0;
-                        std::vector<uint8_t> readBuf(globalMeta.blockSize);
+                        std::vector<uint8_t> readBuf(archive.globalMeta.blockSize);
                         int curFileIdx = -1;
                         os::FileHandle hMultiIn = os::InvalidHandle();
 
@@ -860,7 +901,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                         // Stripe-relative block ID = position within stripe for this track
                         for (auto& ref : trackHealthyBlocks[t]) {
                             if (solved) break;
-                            uint64_t globalIdx = ref.internalTrackBlockId * totalTracks + t;
+                            uint64_t globalIdx = ref.internalTrackBlockId * archive.totalTracks + t;
                             if (globalIdx < stripeStartBlock || globalIdx >= stripeEndBlock) continue;
 
                             const uint8_t* srcData = mappedData + ref.fileOffset;
@@ -879,7 +920,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                                 }
                             }
                             localCalls++;
-                            uint32_t relId = static_cast<uint32_t>((globalIdx - stripeStartBlock) / totalTracks);
+                            uint32_t relId = static_cast<uint32_t>((globalIdx - stripeStartBlock) / archive.totalTracks);
                             WirehairResult res = wirehair_decode(dec, relId, srcData, ref.blockSize);
                             if (res == Wirehair_Success) {
                                 solved = true;
@@ -909,9 +950,9 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                         atomicDecodeCalls += localCalls;
 
                         if (!solved) {
-                            std::cerr << "CRITICAL: Insufficient data to solve stripe " << s << " track " << t << "!\n";
-                            executionSuccess = false;
+                            std::cout << "  Warning: Stripe " << s << " track " << t << " insufficient parity.\n";
                             wirehair_free(dec);
+                            trackFailedStripes[t].push_back(s);
                             return;
                         }
 
@@ -937,10 +978,10 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                             if (hTrackOut != os::InvalidHandle()) {
                                 size_t stripeByteOffset = 0;
                                 for (uint64_t g = stripeStartBlock; g < stripeEndBlock; ++g) {
-                                    if (g % totalTracks != t) continue;
-                                    uint64_t fileOff = g * globalMeta.blockSize;
-                                    size_t blockSz = (fileOff + globalMeta.blockSize <= globalMeta.originalFileSize)
-                                        ? globalMeta.blockSize : (globalMeta.originalFileSize - fileOff);
+                                    if (g % archive.totalTracks != t) continue;
+                                    uint64_t fileOff = g * archive.globalMeta.blockSize;
+                                    size_t blockSz = (fileOff + archive.globalMeta.blockSize <= archive.globalMeta.originalFileSize)
+                                        ? archive.globalMeta.blockSize : (archive.globalMeta.originalFileSize - fileOff);
                                     if (g < blockCorrupted.size() && blockCorrupted[g]) {
                                         os::Seek(hTrackOut, static_cast<int64_t>(fileOff), 0);
                                         os::Write(hTrackOut, stripeBuf.data() + stripeByteOffset, static_cast<uint32_t>(blockSz));
@@ -950,19 +991,45 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                                 os::Close(hTrackOut);
                             }
                         }
+                        {
+                            std::lock_guard<std::mutex> lock(writeMutex);
+                            std::cout << "Stripe " << s << " track " << t << " decoded.\n";
+                        }
                     }));
                 }
                 for (auto& f : futures) f.get();
 
                 // Update track write offsets after all tracks in this batch complete
-                for (uint16_t t = batchStart; t < batchEnd; ++t)
-                    trackWriteOffsets[t] += stripeTrackSizes[t];
+                for (uint16_t t = batchStart; t < batchEnd; ++t) {
+                    bool failed = false;
+                    for (auto fs : trackFailedStripes[t]) {
+                        if (fs == s) { failed = true; break; }
+                    }
+                    if (!failed)
+                        trackWriteOffsets[t] += stripeTrackSizes[t];
+                }
             }
+        }
+
+        // Check for stripe-level failures (some tracks could not be fully decoded per-stripe)
+        uint64_t totalFailedTracks = 0;
+        for (uint16_t t = 0; t < archive.totalTracks; ++t) {
+            if (!trackFailedStripes[t].empty()) {
+                std::cout << "  Warning: Track " << t << " has " << trackFailedStripes[t].size() << " unrecoverable stripe(s):";
+                for (auto s : trackFailedStripes[t]) std::cout << " " << s;
+                std::cout << "\n";
+                totalFailedTracks++;
+            }
+        }
+        if (totalFailedTracks > 0) {
+            std::cout << "  Parity packets from striped archives are stripe-specific and cannot be used\n"
+                      << "  for whole-track recovery. Retry without --max-mem to use global parity.\n";
+            executionSuccess = false;
         }
 
         // Free per-track recovered data if in-place (already written)
         if (inPlace) {
-            for (uint16_t t = 0; t < totalTracks; ++t) {
+            for (uint16_t t = 0; t < archive.totalTracks; ++t) {
                 recoveredTracks[t].clear();
                 recoveredTracks[t].shrink_to_fit();
             }
@@ -991,7 +1058,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
             // ── Streaming output path (no fullMessage buffer) ──
             // Iterate all blocks once, routing each directly to the correct
             // output file. For existing files, only overwrite corrupted blocks.
-            std::vector<size_t> trackOffsets(totalTracks, 0);
+            std::vector<size_t> trackOffsets(archive.totalTracks, 0);
 
             // Resolve per-file target info
             struct FileTarget {
@@ -1001,7 +1068,7 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
             };
             std::vector<FileTarget> targets;
             uint64_t cumOff = 0;
-            for (auto& me : canonicalManifest) {
+            for (auto& me : archive.canonicalManifest) {
                 std::filesystem::path outPath(outputPath);
                 if (!rejectPathTraversal(outPath, me.relPath)) {
                     std::cerr << "Error: manifest path '" << me.relPath << "' escapes output directory.\n";
@@ -1019,12 +1086,15 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
 
             int curTarget = -1;
             os::FileHandle hCurFile = os::InvalidHandle();
-            for (uint64_t g = 0; g < totalBlocks; ++g) {
-                uint64_t blockByteStart = g * globalMeta.blockSize;
+            os::Mapping curMapping = {};
+            for (uint64_t g = 0; g < archive.totalBlocks; ++g) {
+                uint64_t blockByteStart = g * archive.globalMeta.blockSize;
 
-                // Advance to correct target file when block crosses boundary
                 if (curTarget < 0 || blockByteStart >= targets[curTarget].fileEnd) {
-                    if (hCurFile != os::InvalidHandle()) { os::Close(hCurFile); hCurFile = os::InvalidHandle(); }
+                    if (hCurFile != os::InvalidHandle()) {
+                        os::Unmap(curMapping);
+                        os::Close(hCurFile); hCurFile = os::InvalidHandle();
+                    }
                     curTarget++;
                     while (curTarget < (int)targets.size() && blockByteStart >= targets[curTarget].fileEnd)
                         curTarget++;
@@ -1041,57 +1111,70 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                         std::cerr << "Error: Cannot open output file: " << tgt.path << "\n";
                         return;
                     }
+                    uint64_t fileSz = tgt.fileEnd - tgt.fileStart;
+                    if (!tgt.exists && !os::SetFileSize(hCurFile, fileSz)) {
+                        std::cerr << "Error: Cannot set output file size: " << tgt.path << "\n";
+                        os::Close(hCurFile);
+                        return;
+                    }
+                    if (!os::MapWrite(hCurFile, fileSz, curMapping)) {
+                        std::cerr << "Error: Cannot memory-map output file: " << tgt.path << "\n";
+                        os::Close(hCurFile);
+                        return;
+                    }
                 }
 
                 auto& tgt = targets[curTarget];
-                uint16_t tid = g % totalTracks;
-                size_t currentBlockSize = (blockByteStart + globalMeta.blockSize <= globalMeta.originalFileSize)
-                    ? globalMeta.blockSize : (globalMeta.originalFileSize - blockByteStart);
+                uint16_t tid = g % archive.totalTracks;
+                size_t currentBlockSize = (blockByteStart + archive.globalMeta.blockSize <= archive.globalMeta.originalFileSize)
+                    ? archive.globalMeta.blockSize : (archive.globalMeta.originalFileSize - blockByteStart);
 
                 bool shouldWrite = !tgt.exists || (g < blockCorrupted.size() && blockCorrupted[g]);
                 if (shouldWrite) {
                     uint64_t writeStart = (blockByteStart < tgt.fileStart) ? tgt.fileStart : blockByteStart;
                     uint64_t blockByteEnd = blockByteStart + currentBlockSize;
-                    if (blockByteEnd > globalMeta.originalFileSize) blockByteEnd = globalMeta.originalFileSize;
+                    if (blockByteEnd > archive.globalMeta.originalFileSize) blockByteEnd = archive.globalMeta.originalFileSize;
                     uint64_t writeEnd = (blockByteEnd < tgt.fileEnd) ? blockByteEnd : tgt.fileEnd;
                     if (writeStart < writeEnd) {
                         uint64_t localOff = writeStart - tgt.fileStart;
                         uint32_t writeSz = static_cast<uint32_t>(writeEnd - writeStart);
-                        if (!os::Seek(hCurFile, static_cast<int64_t>(localOff), 0) ||
-                            !os::Write(hCurFile, recoveredTracks[tid].data() + trackOffsets[tid] + (writeStart - blockByteStart), writeSz)) {
-                            std::cerr << "Error: Write failed during output (disk full?).\n";
-                            os::Close(hCurFile);
-                            return;
-                        }
+                        memcpy(static_cast<uint8_t*>(curMapping.data) + localOff,
+                               recoveredTracks[tid].data() + trackOffsets[tid] + (writeStart - blockByteStart),
+                               writeSz);
                     }
                 }
                 trackOffsets[tid] += currentBlockSize;
             }
-            if (hCurFile != os::InvalidHandle()) os::Close(hCurFile);
+            if (hCurFile != os::InvalidHandle()) {
+                os::Unmap(curMapping);
+                os::Close(hCurFile);
+            }
 
             // Restore attributes/mtime for all targets
             cumOff = 0;
             for (size_t fi = 0; fi < targets.size(); ++fi) {
-                auto& me = canonicalManifest[fi];
-                os::SetAttributes(targets[fi].path.c_str(), me.attributes);
-                if (me.mtime > 0) os::SetModificationTime(targets[fi].path.c_str(), me.mtime);
+                auto& me = archive.canonicalManifest[fi];
+                if (!os::SetAttributes(targets[fi].path.c_str(), me.attributes))
+                    std::cout << "  Warning: Failed to set attributes on '" << targets[fi].path << "'\n";
+                if (me.mtime > 0 && !os::SetModificationTime(targets[fi].path.c_str(), me.mtime))
+                    std::cout << "  Warning: Failed to set modification time on '" << targets[fi].path << "'\n";
             }
 
-            if (canonicalManifest.size() == 1)
+            if (archive.canonicalManifest.size() == 1)
                 std::cout << "Restored to: " << targets[0].path << "\n";
             else
-                std::cout << "Restored " << canonicalManifest.size() << " file(s) to: " << outputPath << "\n";
+                std::cout << "Restored " << archive.canonicalManifest.size() << " file(s) to: " << outputPath << "\n";
         } else {
             // ── Original fullMessage output path (backward compat) ──
-            if (canonicalManifest.size() == 1) {
-                std::vector<uint8_t> fullMessage(static_cast<size_t>(globalMeta.originalFileSize));
-                std::vector<size_t> trackOffsets(totalTracks, 0);
-                for (uint64_t i = 0; i < totalBlocks; ++i) {
-                    uint16_t trackId = i % totalTracks;
-                    uint64_t offset = i * globalMeta.blockSize;
-                    size_t currentBlockSize = (offset + globalMeta.blockSize <= globalMeta.originalFileSize)
-                        ? globalMeta.blockSize
-                        : (globalMeta.originalFileSize - offset);
+            if (archive.canonicalManifest.size() == 1) {
+                std::vector<uint8_t> fullMessage(static_cast<size_t>(archive.globalMeta.originalFileSize));
+                std::vector<size_t> trackOffsets(archive.totalTracks, 0);
+                for (uint64_t i = 0; i < archive.totalBlocks; ++i) {
+                    uint16_t trackId = i % archive.totalTracks;
+                    uint64_t offset = i * archive.globalMeta.blockSize;
+                    size_t currentBlockSize = (offset + archive.globalMeta.blockSize <= archive.globalMeta.originalFileSize)
+                        ? archive.globalMeta.blockSize
+                        : (archive.globalMeta.originalFileSize - offset);
                     memcpy(fullMessage.data() + offset, recoveredTracks[trackId].data() + trackOffsets[trackId], currentBlockSize);
                     trackOffsets[trackId] += currentBlockSize;
                 }
@@ -1102,19 +1185,19 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                 }
                 std::cout << "Restored to: " << outFile << "\n";
             } else {
-                std::vector<uint8_t> fullMessage(static_cast<size_t>(globalMeta.originalFileSize));
-                std::vector<size_t> trackOffsets(totalTracks, 0);
-                for (uint64_t i = 0; i < totalBlocks; ++i) {
-                    uint16_t trackId = i % totalTracks;
-                    uint64_t offset = i * globalMeta.blockSize;
-                    size_t currentBlockSize = (offset + globalMeta.blockSize <= globalMeta.originalFileSize)
-                        ? globalMeta.blockSize
-                        : (globalMeta.originalFileSize - offset);
+                std::vector<uint8_t> fullMessage(static_cast<size_t>(archive.globalMeta.originalFileSize));
+                std::vector<size_t> trackOffsets(archive.totalTracks, 0);
+                for (uint64_t i = 0; i < archive.totalBlocks; ++i) {
+                    uint16_t trackId = i % archive.totalTracks;
+                    uint64_t offset = i * archive.globalMeta.blockSize;
+                    size_t currentBlockSize = (offset + archive.globalMeta.blockSize <= archive.globalMeta.originalFileSize)
+                        ? archive.globalMeta.blockSize
+                        : (archive.globalMeta.originalFileSize - offset);
                     memcpy(fullMessage.data() + offset, recoveredTracks[trackId].data() + trackOffsets[trackId], currentBlockSize);
                     trackOffsets[trackId] += currentBlockSize;
                 }
                 uint64_t cumulativeOffset = 0;
-                for (auto& me : canonicalManifest) {
+                for (auto& me : archive.canonicalManifest) {
                     std::filesystem::path outPath(outputPath);
                     if (!rejectPathTraversal(outPath, me.relPath)) {
                         std::cerr << "Error: manifest path '" << me.relPath << "' escapes output directory.\n";
@@ -1129,16 +1212,16 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                         && std::filesystem::is_regular_file(filePath)
                         && std::filesystem::file_size(filePath) == me.fileSize;
                     if (exists) {
-                        uint64_t firstBlock = fileStart / globalMeta.blockSize;
-                        uint64_t lastBlock = (fileEnd - 1) / globalMeta.blockSize;
+                        uint64_t firstBlock = fileStart / archive.globalMeta.blockSize;
+                        uint64_t lastBlock = (fileEnd - 1) / archive.globalMeta.blockSize;
                         os::FileHandle hFile = os::OpenReadWrite(filePath.c_str());
                         if (hFile != os::InvalidHandle()) {
-                            for (uint64_t g = firstBlock; g <= lastBlock && g < totalBlocks; ++g) {
+                            for (uint64_t g = firstBlock; g <= lastBlock && g < archive.totalBlocks; ++g) {
                                 if (g < blockCorrupted.size() && blockCorrupted[g]) {
-                                    uint64_t blockByteStart = g * globalMeta.blockSize;
+                                    uint64_t blockByteStart = g * archive.globalMeta.blockSize;
                                     uint64_t writeStart = (blockByteStart < fileStart) ? fileStart : blockByteStart;
-                                    uint64_t blockByteEnd = blockByteStart + globalMeta.blockSize;
-                                    if (blockByteEnd > globalMeta.originalFileSize) blockByteEnd = globalMeta.originalFileSize;
+                                    uint64_t blockByteEnd = blockByteStart + archive.globalMeta.blockSize;
+                                    if (blockByteEnd > archive.globalMeta.originalFileSize) blockByteEnd = archive.globalMeta.originalFileSize;
                                     uint64_t writeEnd = (blockByteEnd < fileEnd) ? blockByteEnd : fileEnd;
                                     if (writeStart >= writeEnd) continue;
                                     uint64_t localOff = writeStart - fileStart;
@@ -1149,8 +1232,10 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                             }
                             os::Close(hFile);
                         }
-                        os::SetAttributes(filePath.c_str(), me.attributes);
-                        if (me.mtime > 0) os::SetModificationTime(filePath.c_str(), me.mtime);
+                        if (!os::SetAttributes(filePath.c_str(), me.attributes))
+                            std::cout << "  Warning: Failed to set attributes on '" << filePath << "'\n";
+                        if (me.mtime > 0 && !os::SetModificationTime(filePath.c_str(), me.mtime))
+                            std::cout << "  Warning: Failed to set modification time on '" << filePath << "'\n";
                     } else {
                         std::ofstream outFile(filePath, std::ios::binary);
                         if (outFile) {
@@ -1160,13 +1245,15 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
                                 return;
                             }
                             outFile.close();
-                            os::SetAttributes(filePath.c_str(), me.attributes);
-                            if (me.mtime > 0) os::SetModificationTime(filePath.c_str(), me.mtime);
+                            if (!os::SetAttributes(filePath.c_str(), me.attributes))
+                                std::cout << "  Warning: Failed to set attributes on '" << filePath << "'\n";
+                            if (me.mtime > 0 && !os::SetModificationTime(filePath.c_str(), me.mtime))
+                                std::cout << "  Warning: Failed to set modification time on '" << filePath << "'\n";
                         }
                     }
                     cumulativeOffset += me.fileSize;
                 }
-                std::cout << "Restored " << canonicalManifest.size() << " file(s) to: " << outputPath << "\n";
+                std::cout << "Restored " << archive.canonicalManifest.size() << " file(s) to: " << outputPath << "\n";
             }
         }
     }
@@ -1184,299 +1271,79 @@ void RepairDataset(const std::string& damagedPath, const std::string& parityPath
     } else {
         uint64_t totalParity = parityPacketsSeen;
         uint64_t needEstimate = 0;
-        for (uint16_t t = 0; t < totalTracks; ++t) {
+        for (uint16_t t = 0; t < archive.totalTracks; ++t) {
             uint64_t h = trackHealthyBlocks[t].size();
             uint64_t p = trackPackets[t].size();
             if (p < h + 1) needEstimate += (h + 1) - p;
         }
-        int extraPct10 = static_cast<int>((needEstimate * 1000.0 / totalBlocks) + 0.5);
-        std::cout << "FAILURE: Repair incomplete. Have " << totalBlocks << " data blocks, "
+        int extraPct10 = static_cast<int>((needEstimate * 1000.0 / archive.totalBlocks) + 0.5);
+        std::cout << "FAILURE: Repair incomplete. Have " << archive.totalBlocks << " data blocks, "
                   << totalParity << " parity packets.\n"
                   << "         Need ~" << needEstimate << " more packets (≈"
                   << (extraPct10 / 10) << "." << (extraPct10 % 10) << "% additional overhead).";
     }
-    showElapsed(); std::cout << "\n";
+    showElapsed(startTime); std::cout << "\n";
+}
+
+void ListManifest(const std::string& parityPath) {
+    ParsedArchive archive = parseArchive(parityPath);
+    if (!archive.valid) return;
+
+    std::cout << "\nSource files:\n";
+    for (size_t i = 0; i < archive.canonicalManifest.size(); ++i) {
+        auto& me = archive.canonicalManifest[i];
+        std::cout << "  " << me.relPath
+                  << " (" << (me.fileSize / (1024 * 1024.0)) << " MiB)";
+        if (me.mtime > 0) {
+            std::time_t t = static_cast<std::time_t>(me.mtime);
+            char buf[64];
+            struct tm gmt;
+#ifdef _WIN32
+            gmtime_s(&gmt, &t);
+#else
+            gmtime_r(&t, &gmt);
+#endif
+            std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &gmt);
+            std::cout << " - " << buf << " UTC";
+        }
+        if (me.attributes != 0) {
+            std::cout << " [attrs:0x" << std::hex << me.attributes << std::dec << "]";
+        }
+        std::cout << "\n";
+    }
 }
 
 void InfoCheck(const std::string& parityPath, bool debug, const std::string& sourceDir) {
     auto startTime = std::chrono::steady_clock::now();
-    auto showElapsed = [&]() {
-        double e = elapsedSecsSince(startTime);
-        if (e >= 60.0) {
-            int m = static_cast<int>(e / 60);
-            std::cout << " (" << m << "m " << (e - m * 60) << "s)";
-        } else {
-            std::cout << " (" << e << "s)";
-        }
-    };
-
-    // ── 1. Read archive headers ──────────────────────────
-    std::ifstream parityIn(parityPath, std::ios::binary);
-    if (!parityIn) {
-        std::cerr << "Error: Cannot open parity file: " << parityPath << "\n";
-        return;
-    }
-
-    parityIn.seekg(0, std::ios::end);
-    std::streampos fileSize = parityIn.tellg();
-    if (fileSize < static_cast<std::streampos>(sizeof(uint64_t))) {
-        std::cerr << "Error: Archive too small.\n"; return;
-    }
-    parityIn.seekg(-static_cast<std::streamoff>(sizeof(uint64_t)), std::ios::end);
-    uint64_t headerBlockSize = 0;
-    readU64LE(parityIn, headerBlockSize);
-
-    if (headerBlockSize < sizeof(PacketHeader) || headerBlockSize > static_cast<uint64_t>(fileSize) - sizeof(uint64_t)) {
-        std::cerr << "Error: Invalid header size.\n"; return;
-    }
-    std::streampos headerEndOffset = fileSize - static_cast<std::streampos>(sizeof(uint64_t)) - static_cast<std::streampos>(headerBlockSize);
-    if (headerEndOffset <= 0 || headerEndOffset >= fileSize - static_cast<std::streampos>(sizeof(uint64_t))) {
-        std::cerr << "Error: Corrupt archive offset.\n"; return;
-    }
-
-    auto readHeaderBlock = [&](std::streampos pos, PacketHeader& hdr, std::vector<uint64_t>& hashes, std::vector<ManifestEntry>& manifest) -> bool {
-        parityIn.seekg(pos);
-        readPacketHeader(parityIn, hdr);
-        if (!parityIn || hdr.magic != WHPAR_MAGIC) return false;
-        uint32_t hashCount = 0;
-        readU32LE(parityIn, hashCount);
-        if (hashCount > (static_cast<uint64_t>(fileSize) - static_cast<uint64_t>(static_cast<std::streamoff>(pos))
-            - sizeof(PacketHeader) - sizeof(uint32_t) - 1) / sizeof(uint64_t)) return false;
-        hashes.resize(hashCount);
-        for (uint32_t i = 0; i < hashCount; ++i) readU64LE(parityIn, hashes[i]);
-        uint8_t hasManifest = 0;
-        parityIn.read(reinterpret_cast<char*>(&hasManifest), sizeof(hasManifest));
-        if (hasManifest) {
-            uint32_t fileCount = 0;
-            readU32LE(parityIn, fileCount);
-            for (uint32_t i = 0; i < fileCount; ++i) {
-                uint32_t pathLen = 0;
-                readU32LE(parityIn, pathLen);
-                std::string path; path.resize(pathLen);
-                parityIn.read(&path[0], pathLen);
-                ManifestEntry me;
-                me.relPath = path;
-                readU64LE(parityIn, me.fileSize);
-                readU64LE(parityIn, me.mtime);
-                readU32LE(parityIn, me.attributes);
-                manifest.push_back(me);
-            }
-        }
-        return true;
-    };
-
-    auto verifyHeaderEcc = [&](std::streampos pos, uint64_t totalSize) -> bool {
-        if (totalSize <= 8) return false;
-        uint64_t bodySize = totalSize - 8;
-        std::vector<uint8_t> body(static_cast<size_t>(bodySize));
-        parityIn.seekg(pos);
-        parityIn.read(reinterpret_cast<char*>(body.data()), static_cast<std::streamsize>(bodySize));
-        if (!parityIn) return false;
-        uint64_t stored = 0;
-        readU64LE(parityIn, stored);
-        return XXH3_64bits(body.data(), bodySize) == stored;
-    };
-
-    PacketHeader headerA, headerEnd;
-    std::vector<uint64_t> hashesA, hashesEnd;
-    std::vector<ManifestEntry> manifestA, manifestEnd;
-
-    bool mainOk = readHeaderBlock(0, headerA, hashesA, manifestA);
-    if (mainOk) mainOk = verifyHeaderEcc(0, headerBlockSize);
-    bool mirrorOk = (headerEndOffset > 0 && headerEndOffset < fileSize - static_cast<std::streampos>(sizeof(uint64_t)))
-        ? readHeaderBlock(headerEndOffset, headerEnd, hashesEnd, manifestEnd)
-        : false;
-    if (mirrorOk) mirrorOk = verifyHeaderEcc(headerEndOffset, headerBlockSize);
-
-    PacketHeader globalMeta;
-    std::vector<uint64_t> referenceHashes;
-    std::vector<ManifestEntry> canonicalManifest;
-    bool useXxh64;
-
-    if (mainOk && mirrorOk) {
-        if (hashesA == hashesEnd) {
-            globalMeta = headerEnd;
-            referenceHashes = std::move(hashesEnd);
-            canonicalManifest = !manifestEnd.empty() ? std::move(manifestEnd) : std::move(manifestA);
-        } else {
-            std::cerr << "Warning: mirrored header mismatch; using primary.\n";
-            globalMeta = headerA;
-            referenceHashes = std::move(hashesA);
-            canonicalManifest = std::move(manifestA);
-        }
-    } else if (mirrorOk) {
-        globalMeta = headerEnd;
-        referenceHashes = std::move(hashesEnd);
-        canonicalManifest = std::move(manifestEnd);
-        std::cerr << "Warning: primary header corrupt; recovered from mirrored header.\n";
-    } else if (mainOk) {
-        globalMeta = headerA;
-        referenceHashes = std::move(hashesA);
-        canonicalManifest = std::move(manifestA);
-        std::cerr << "Warning: mirrored header missing or corrupt; using primary.\n";
-    } else {
-        std::cerr << "Error: Invalid or corrupt archive (both headers unusable)\n";
-        return;
-    }
-
-    useXxh64 = (globalMeta.matrixTrack == 1);
-    auto hashBlock = [useXxh64](const uint8_t* data, size_t len) -> uint64_t {
-        return useXxh64 ? XXH3_64bits(data, len) : XXH32(data, len, 0);
-    };
-
-    uint64_t totalBlocks = (globalMeta.originalFileSize + globalMeta.blockSize - 1) / globalMeta.blockSize;
-    uint16_t totalTracks = static_cast<uint16_t>(globalMeta.fountainId);
-    if (totalTracks == 0) totalTracks = 1;
-    uint64_t stripeCount = globalMeta.blockSequence;
-    if (stripeCount == 0) stripeCount = 1;
 
     std::cout << "Archive: " << parityPath << "\n";
-    std::cout << "Target File Size: " << (globalMeta.originalFileSize / (1024 * 1024.0)) << " MiB\n";
-    std::cout << "Expected Blocks: " << referenceHashes.size() << " (" << (globalMeta.blockSize / 1024) << " KB each)\n";
-    std::cout << "Interleaving Architecture: " << totalTracks << " parallel matrix track(s).\n";
-    if (stripeCount > 1)
-        std::cout << "Stripe count: " << stripeCount << "\n";
-    parityIn.close();
+    ParsedArchive archive = parseArchive(parityPath);
+    if (!archive.valid) return;
 
     // ── 2. Scan and parse parity packets ─────────────────
-    std::vector<std::vector<const uint8_t*>> trackParityPayloads(totalTracks);
-    std::vector<std::vector<uint64_t>> trackParityHashes(totalTracks);
+    std::vector<std::vector<const uint8_t*>> trackParityPayloads(archive.totalTracks);
+    std::vector<std::vector<uint64_t>> trackParityHashes(archive.totalTracks);
     size_t parityPacketsSeen = 0;
 
-    struct ArchiveMapping {
-        os::Mapping mapping;
-        std::string path;
-    };
     std::vector<ArchiveMapping> archiveMappings;
 
-    auto parsePacketsFromArchive = [&](const std::string& archPath, bool isPrimary) -> bool {
-        os::Mapping mapping;
-        if (!os::MapRead(archPath.c_str(), mapping)) {
-            if (isPrimary) std::cerr << "Error: Cannot memory-map parity file: " << archPath << "\n";
-            else std::cerr << "Warning: Cannot memory-map supplement: " << archPath << "\n";
-            return false;
-        }
-        const uint8_t* base = static_cast<const uint8_t*>(mapping.data);
-        uint64_t fileSz = mapping.size;
-
-        uint64_t hdrBlockSz = 0;
-        memcpy(&hdrBlockSz, base + fileSz - sizeof(uint64_t), sizeof(uint64_t));
-        hdrBlockSz = le_to_cpu64(hdrBlockSz);
-        if (hdrBlockSz < sizeof(PacketHeader)) {
-            if (!isPrimary) std::cerr << "Warning: Invalid supplement header size: " << archPath << "\n";
-            os::Unmap(mapping);
-            return false;
-        }
-        uint64_t dataStart = hdrBlockSz;
-        uint64_t mirrorOffset = fileSz - sizeof(uint64_t) - hdrBlockSz;
-        if (dataStart >= mirrorOffset) {
-            if (!isPrimary) std::cerr << "Warning: Corrupt supplement: " << archPath << "\n";
-            os::Unmap(mapping);
-            return false;
-        }
-        uint64_t dataSize = mirrorOffset - dataStart;
-        const uint8_t* dataPtr = base + dataStart;
-        size_t dataSz = static_cast<size_t>(dataSize);
-
-        size_t bufOff = 0;
-        while (bufOff + sizeof(PacketHeader) <= dataSz) {
-            PacketHeader pkt;
-            memcpy(&pkt, dataPtr + bufOff, sizeof(pkt));
-            pkt.magic = le_to_cpu32(pkt.magic);
-            pkt.originalFileSize = le_to_cpu64(pkt.originalFileSize);
-            pkt.blockSize = le_to_cpu32(pkt.blockSize);
-            pkt.matrixTrack = le_to_cpu16(pkt.matrixTrack);
-            pkt.fountainId = le_to_cpu32(pkt.fountainId);
-            pkt.payloadHash = le_to_cpu64(pkt.payloadHash);
-            pkt.blockSequence = le_to_cpu32(pkt.blockSequence);
-            pkt.expectedBlockHash = le_to_cpu64(pkt.expectedBlockHash);
-            bufOff += sizeof(PacketHeader);
-
-            if (pkt.magic == WHPAR_MAGIC) {
-                if (bufOff + sizeof(uint32_t) > dataSz) break;
-                uint32_t hashCount = le_to_cpu32(*reinterpret_cast<const uint32_t*>(dataPtr + bufOff));
-                bufOff += sizeof(uint32_t) + static_cast<size_t>(hashCount) * sizeof(uint64_t);
-                if (bufOff >= dataSz) break;
-                uint8_t hm = dataPtr[bufOff]; bufOff++;
-                if (hm) {
-                    if (bufOff + sizeof(uint32_t) > dataSz) break;
-                    uint32_t fc = le_to_cpu32(*reinterpret_cast<const uint32_t*>(dataPtr + bufOff));
-                    bufOff += sizeof(uint32_t);
-                    for (uint32_t i = 0; i < fc; ++i) {
-                        if (bufOff + sizeof(uint32_t) > dataSz) break;
-                        uint32_t plen = le_to_cpu32(*reinterpret_cast<const uint32_t*>(dataPtr + bufOff));
-                        bufOff += sizeof(uint32_t) + plen + sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t);
-                    }
-                }
-                continue;
-            }
-
-            if (pkt.magic != WHPAR_PKT_MAGIC) {
-                bufOff += (pkt.blockSize > 0) ? static_cast<size_t>(pkt.blockSize) : 0;
-                parityPacketsSeen++;
-                continue;
-            }
-
-            if (pkt.matrixTrack >= totalTracks || pkt.blockSize > 2 * 1024 * 1024) {
-                bufOff += static_cast<size_t>(pkt.blockSize);
-                continue;
-            }
-
-            if (bufOff + pkt.blockSize > dataSz) break;
-
-            trackParityPayloads[pkt.matrixTrack].push_back(dataPtr + bufOff);
-            trackParityHashes[pkt.matrixTrack].push_back(pkt.payloadHash);
-            bufOff += pkt.blockSize;
-            parityPacketsSeen++;
-        }
-
-        archiveMappings.push_back({std::move(mapping), archPath});
-        return true;
+    auto onPacket = [&](uint16_t track, const uint8_t* payload, uint32_t payloadSize,
+                        uint32_t fountainId, uint32_t blockSequence,
+                        uint64_t payloadHash, uint64_t expectedBlockHash, uint32_t stripeIndex) {
+        (void)fountainId; (void)blockSequence; (void)expectedBlockHash; (void)stripeIndex;
+        trackParityPayloads[track].push_back(payload);
+        trackParityHashes[track].push_back(payloadHash);
     };
 
-    parsePacketsFromArchive(parityPath, true);
-
-    // Scan for supplemental archives
-    {
-        auto archDir = std::filesystem::path(parityPath).parent_path();
-        if (archDir.empty()) archDir = ".";
-        std::string primaryFn = std::filesystem::path(parityPath).filename().string();
-        std::string baseName = primaryFn;
-        {
-            size_t extDot = baseName.rfind('.');
-            if (extDot != std::string::npos) baseName = baseName.substr(0, extDot);
-            size_t plusPos = baseName.find('+');
-            if (plusPos != std::string::npos) baseName = baseName.substr(0, plusPos);
-            size_t ppos = baseName.rfind(".p");
-            if (ppos != std::string::npos && ppos > 0) baseName = baseName.substr(0, ppos);
-        }
-        if (std::filesystem::is_directory(archDir)) {
-            for (auto& entry : std::filesystem::directory_iterator(archDir)) {
-                if (!std::filesystem::is_regular_file(entry.path())) continue;
-                std::string name = entry.path().filename().string();
-                if (name.size() < 7) continue;
-                std::string ext = name.substr(name.size() - 6);
-                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-                if (ext != ".whpar") continue;
-                if (name.find(baseName) != 0) continue;
-                std::string absEntry = std::filesystem::absolute(entry.path()).u8string();
-                std::string absPrimary = std::filesystem::absolute(parityPath).u8string();
-                if (absEntry == absPrimary) continue;
-                size_t plusPos = name.find('+');
-                if (plusPos == std::string::npos) continue;
-                if (plusPos >= name.size() - 1) continue;
-                if (debug) std::cout << "Found supplement: " << name << "\n";
-                parsePacketsFromArchive(entry.path().u8string(), false);
-            }
-        }
-    }
+    walkArchivePackets(parityPath, archive, true, archiveMappings, parityPacketsSeen, onPacket);
+    scanSupplementArchives(parityPath, archive, archiveMappings, parityPacketsSeen, onPacket);
 
     // Hash-verify parity packets
-    std::vector<uint32_t> validParityPerTrack(totalTracks, 0);
-    for (uint16_t t = 0; t < totalTracks; ++t) {
+    std::vector<uint32_t> validParityPerTrack(archive.totalTracks, 0);
+    for (uint16_t t = 0; t < archive.totalTracks; ++t) {
         for (size_t i = 0; i < trackParityPayloads[t].size(); ++i) {
-            uint32_t sz = globalMeta.blockSize;
-            if (hashBlock(trackParityPayloads[t][i], sz) == trackParityHashes[t][i])
+            uint32_t sz = archive.globalMeta.blockSize;
+            if (archive.hashBlock(trackParityPayloads[t][i], sz) == trackParityHashes[t][i])
                 validParityPerTrack[t]++;
         }
     }
@@ -1491,75 +1358,61 @@ void InfoCheck(const std::string& parityPath, bool debug, const std::string& sou
               << (parityPacketsSeen > 0 ? std::to_string(validParityPerTrack[0]) : "0") << " valid)\n";
 
     // ── 3. Resolve source files ──────────────────────────
-    std::string archiveDir = std::filesystem::path(parityPath).parent_path().u8string();
-    if (archiveDir.empty()) archiveDir = ".";
-    std::string searchDir = sourceDir.empty() ? archiveDir : sourceDir;
-    std::vector<std::string> sourcePaths;
-
-    for (auto& me : canonicalManifest) {
-        std::filesystem::path candidate1 = std::filesystem::path(searchDir) / me.relPath;
-        std::filesystem::path candidate2 = std::filesystem::path(archiveDir) / me.relPath;
-        std::filesystem::path candidate3 = std::filesystem::path(".") / me.relPath;
-        if (std::filesystem::exists(candidate1)) {
-            sourcePaths.push_back(candidate1.u8string());
-        } else if (std::filesystem::exists(candidate2)) {
-            sourcePaths.push_back(candidate2.u8string());
-        } else if (std::filesystem::exists(candidate3)) {
-            sourcePaths.push_back(candidate3.u8string());
-        } else {
-            sourcePaths.push_back("");
-        }
-    }
+    std::string searchDir = sourceDir.empty() ? archive.archiveDir : sourceDir;
+    std::vector<std::string> sourcePaths = resolveAllSources(archive.canonicalManifest, searchDir, archive.archiveDir);
 
     // Report source files
     std::cout << "\nSource files:\n";
-    for (size_t i = 0; i < canonicalManifest.size(); ++i) {
-        std::cout << "  " << canonicalManifest[i].relPath
-                  << " (" << (canonicalManifest[i].fileSize / (1024 * 1024.0)) << " MiB)";
+    for (size_t i = 0; i < archive.canonicalManifest.size(); ++i) {
+        std::cout << "  " << archive.canonicalManifest[i].relPath
+                  << " (" << (archive.canonicalManifest[i].fileSize / (1024 * 1024.0)) << " MiB)";
         if (sourcePaths[i].empty()) {
             std::cout << " - NOT FOUND\n";
         } else {
             uint64_t actualSize = std::filesystem::file_size(sourcePaths[i]);
-            if (actualSize == canonicalManifest[i].fileSize) {
+            if (actualSize == archive.canonicalManifest[i].fileSize) {
                 std::cout << " - found\n";
             } else {
-                std::cout << " - found but size mismatch (" << actualSize << " vs expected " << canonicalManifest[i].fileSize << ")\n";
+                std::cout << " - found but size mismatch (" << actualSize << " vs expected " << archive.canonicalManifest[i].fileSize << ")\n";
             }
         }
     }
 
     // ── 4. Hash source files, compare to references ──────
-    std::vector<uint8_t> blockCorrupted(totalBlocks, 0);
-    std::vector<std::vector<uint32_t>> trackHealthyBlocks(totalTracks);
+    std::vector<uint8_t> blockCorrupted(archive.totalBlocks, 0);
+    std::vector<std::vector<uint32_t>> trackHealthyBlocks(archive.totalTracks);
     uint64_t corruptedBlocksCount = 0;
 
-    // Build file offset map
-    std::vector<uint64_t> fileStartOffsets;
-    std::vector<uint64_t> fileEndOffsets;
-    {
-        uint64_t off = 0;
-        for (auto& me : canonicalManifest) {
-            fileStartOffsets.push_back(off);
-            off += me.fileSize;
-            fileEndOffsets.push_back(off);
-        }
-    }
+    FileOffsets fo = computeFileOffsets(archive.canonicalManifest);
 
     {
-        std::vector<uint8_t> composeBuf(globalMeta.blockSize);
-        Progress prog(totalBlocks, "Analysis");
+        std::vector<uint8_t> composeBuf(archive.globalMeta.blockSize);
+        Progress prog(archive.totalBlocks, "Analysis");
         int curFileIdx = -1;
         os::FileHandle hCurFile = os::InvalidHandle();
+        uint64_t fileCorrupted = 0;
+        int reportFileIdx = -1;
 
-        for (uint64_t i = 0; i < totalBlocks; ++i) {
-            uint64_t offset = i * globalMeta.blockSize;
-            size_t currentBlockSize = (offset + globalMeta.blockSize <= globalMeta.originalFileSize)
-                ? globalMeta.blockSize : (globalMeta.originalFileSize - offset);
+        for (uint64_t i = 0; i < archive.totalBlocks; ++i) {
+            uint64_t offset = i * archive.globalMeta.blockSize;
+            size_t currentBlockSize = (offset + archive.globalMeta.blockSize <= archive.globalMeta.originalFileSize)
+                ? archive.globalMeta.blockSize : (archive.globalMeta.originalFileSize - offset);
 
-            // Find which source file this block belongs to
             int fileIdx = -1;
-            for (size_t f = 0; f < fileStartOffsets.size(); ++f) {
-                if (offset >= fileStartOffsets[f] && offset < fileEndOffsets[f]) { fileIdx = static_cast<int>(f); break; }
+            for (size_t f = 0; f < fo.fileStartOffsets.size(); ++f) {
+                if (offset >= fo.fileStartOffsets[f] && offset < fo.fileEndOffsets[f]) { fileIdx = static_cast<int>(f); break; }
+            }
+
+            if (fileIdx != reportFileIdx) {
+                if (reportFileIdx >= 0) {
+                    auto& me = archive.canonicalManifest[reportFileIdx];
+                    if (fileCorrupted == 0)
+                        std::cout << "  " << me.relPath << " (" << (me.fileSize / (1024 * 1024.0)) << " MiB) - OK\n";
+                    else
+                        std::cout << "  " << me.relPath << " (" << (me.fileSize / (1024 * 1024.0)) << " MiB) - " << fileCorrupted << " block(s) DAMAGED\n";
+                }
+                reportFileIdx = fileIdx;
+                fileCorrupted = 0;
             }
 
             bool haveData = false;
@@ -1570,8 +1423,8 @@ void InfoCheck(const std::string& parityPath, bool debug, const std::string& sou
                     curFileIdx = fileIdx;
                 }
                 if (hCurFile != os::InvalidHandle()) {
-                    uint64_t localOff = offset - fileStartOffsets[fileIdx];
-                    uint64_t avail = fileEndOffsets[fileIdx] - offset;
+                    uint64_t localOff = offset - fo.fileStartOffsets[fileIdx];
+                    uint64_t avail = fo.fileEndOffsets[fileIdx] - offset;
                     size_t firstPart = static_cast<size_t>(std::min<uint64_t>(avail, currentBlockSize));
                     os::Seek(hCurFile, static_cast<int64_t>(localOff), 0);
                     uint32_t br = 0;
@@ -1579,7 +1432,7 @@ void InfoCheck(const std::string& parityPath, bool debug, const std::string& sou
                     if (firstPart < currentBlockSize) {
                         size_t secondPart = currentBlockSize - firstPart;
                         int fileIdx2 = fileIdx + 1;
-                        if (fileIdx2 < (int)canonicalManifest.size() && fileIdx2 < (int)sourcePaths.size() && !sourcePaths[fileIdx2].empty()) {
+                        if (fileIdx2 < (int)archive.canonicalManifest.size() && fileIdx2 < (int)sourcePaths.size() && !sourcePaths[fileIdx2].empty()) {
                             os::FileHandle h2 = os::OpenRead(sourcePaths[fileIdx2].c_str(), false);
                             if (h2 != os::InvalidHandle()) {
                                 uint32_t br2 = 0;
@@ -1592,21 +1445,30 @@ void InfoCheck(const std::string& parityPath, bool debug, const std::string& sou
                 }
             }
 
-            uint16_t trackId = i % totalTracks;
+            uint16_t trackId = i % archive.totalTracks;
             if (haveData) {
-                uint64_t h = hashBlock(composeBuf.data(), currentBlockSize);
-                uint64_t expectedHash = (i < referenceHashes.size()) ? referenceHashes[i] : 0;
+                uint64_t h = archive.hashBlock(composeBuf.data(), currentBlockSize);
+                uint64_t expectedHash = (i < archive.referenceHashes.size()) ? archive.referenceHashes[i] : 0;
                 if (h == expectedHash) {
                     trackHealthyBlocks[trackId].push_back(1);
                 } else {
-                    corruptedBlocksCount++;
+                    corruptedBlocksCount++; fileCorrupted++;
                     blockCorrupted[i] = 1;
                 }
             } else {
-                corruptedBlocksCount++;
+                corruptedBlocksCount++; fileCorrupted++;
                 blockCorrupted[i] = 1;
             }
             prog.tick();
+        }
+
+        // Report last file
+        if (reportFileIdx >= 0) {
+            auto& me = archive.canonicalManifest[reportFileIdx];
+            if (fileCorrupted == 0)
+                std::cout << "  " << me.relPath << " (" << (me.fileSize / (1024 * 1024.0)) << " MiB) - OK\n";
+            else
+                std::cout << "  " << me.relPath << " (" << (me.fileSize / (1024 * 1024.0)) << " MiB) - " << fileCorrupted << " block(s) DAMAGED\n";
         }
 
         if (hCurFile != os::InvalidHandle()) os::Close(hCurFile);
@@ -1614,21 +1476,21 @@ void InfoCheck(const std::string& parityPath, bool debug, const std::string& sou
     }
 
     // ── 5. Report ────────────────────────────────────────
-    uint64_t healthyBlocks = totalBlocks - corruptedBlocksCount;
+    uint64_t healthyBlocks = archive.totalBlocks - corruptedBlocksCount;
 
     if (corruptedBlocksCount == 0) {
-        std::cout << "\nStatus: All files match hash - repair not needed.";
-        showElapsed(); std::cout << "\n";
+        std::cout << "Status: All files match hash - repair not needed.";
+        showElapsed(startTime); std::cout << "\n";
         return;
     }
 
-    std::cout << "\nStatus: Corruption detected - " << corruptedBlocksCount << " block(s) damaged ("
+    std::cout << "Status: Corruption detected - " << corruptedBlocksCount << " block(s) damaged ("
               << healthyBlocks << " healthy).\n";
 
     // Per-track healthy count for need estimate
     uint64_t needEstimate = 0;
     uint64_t totalValidParity = 0;
-    for (uint16_t t = 0; t < totalTracks; ++t) {
+    for (uint16_t t = 0; t < archive.totalTracks; ++t) {
         uint64_t h = trackHealthyBlocks[t].size();
         uint64_t p = validParityPerTrack[t];
         totalValidParity += p;
@@ -1636,15 +1498,15 @@ void InfoCheck(const std::string& parityPath, bool debug, const std::string& sou
     }
 
     if (needEstimate > 0) {
-        int extraPct10 = static_cast<int>((needEstimate * 1000.0 / totalBlocks) + 0.5);
-        std::cout << "FAILURE: Repair incomplete. Have " << totalBlocks << " data blocks, "
+        int extraPct10 = static_cast<int>((needEstimate * 1000.0 / archive.totalBlocks) + 0.5);
+        std::cout << "FAILURE: Repair incomplete. Have " << archive.totalBlocks << " data blocks, "
                   << totalValidParity << " valid parity packets.\n"
                   << "         Need ~" << needEstimate << " more packets (≈"
                   << (extraPct10 / 10) << "." << (extraPct10 % 10) << "% additional overhead).";
-        showElapsed(); std::cout << "\n";
+        showElapsed(startTime); std::cout << "\n";
     } else {
         std::cout << "Sufficient parity available to repair.";
-        showElapsed(); std::cout << "\n";
+        showElapsed(startTime); std::cout << "\n";
     }
 
     // ── 6. Prompt for repair ─────────────────────────────
