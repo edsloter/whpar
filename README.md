@@ -3,7 +3,7 @@
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Platform: Windows | Linux](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-blue.svg)](https://microsoft.com/windows)
 
-**whpar** is a high-speed, linear-time fountain parity CLI utility. It produces and consumes Wirehair-style fountain parity archives (`.whpar`) to protect and repair files against data corruption. 
+**whpar** is a high-speed, linear-time fountain parity CLI (and now GUI!) utility. It produces and consumes Wirehair-style fountain parity archives (`.whpar`) to protect and repair files against data corruption. 
 
 It is intended as a compact par2-like encoder/repair tool that produces linear-time parity streams and can repair damaged files using an attached parity archive, it leverages advanced fountain codes to achieve near-instantaneous encoding and decoding speeds.
 
