@@ -209,7 +209,7 @@ whpar -r <parity.whpar> [-o <outpath>] [-j <numJobs>] [--max-mem <size>] [-f] [-
 ```
 
 | Option | Description |
-|---|---|---|
+|---|---|
 | `-o <outpath>` | Destination path. For multi-file archives this must be a directory. For single-file archives, may be a directory or explicit filename. |
 | `-j <numJobs>` | Concurrent decoder tracks (1–128). Default: auto (2 or 3 based on system RAM). Use `-j 1` to halve peak decoder memory. |
 | `--max-mem <size>` | Stream recovered data directly to disk per-block, avoiding the ~2× file size output buffer. Pair with `-j 1` when total RAM is limited. |
