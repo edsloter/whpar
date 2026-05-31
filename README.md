@@ -164,9 +164,7 @@ The **pNN** value is the *cumulative* overhead of the archive being supplemented
 | `-b <sizeKB>` | Block size in KB (e.g. `64`, `1M`, `4G`). Auto-selected by default. |
 | `-j <numJobs>` | Parallel encoding tracks (create/add) or concurrent decoders (repair). Default: CPU core count. |
 | `--xxh64` | Use XXH3\_64bit hashing instead of XXH32 for faster/larger checksums. |
-| `--max-mem <size>` | Memory limit (e.g. `512MB`, `2GB`, `4G`). Minimum 256 KB. |
-| | **Create/Add:** By default whpar loads the entire source into RAM. With this flag the encoder processes the file in stripes that each fit within the budget — lower values increase passes but reduce peak RAM. |
-| | **Repair:** By default repair holds the full recovered data plus an output buffer in memory (~2× file size). With this flag output is streamed directly to disk per-block, eliminating the output buffer. Pair with `-j 1` to minimize peak memory. |
+| `--max-mem <size>` | Memory limit (e.g. `512MB`, `2GB`, `4G`). Minimum 256 KB. **Create/Add:** By default whpar loads the entire source into RAM — with this flag the encoder processes the file in stripes that each fit within the budget. **Repair:** By default repair holds the full recovered data plus an output buffer in memory (~2× file size) — with this flag output is streamed directly to disk per-block. Pair with `-j 1` to minimize peak memory. |
 | `--no-recursive` | Only process files in the given directory, not subdirectories. |
 | `-f, --force` | Overwrite existing output without prompting. |
 | `--debug` | Enable debug output during encoding. |
