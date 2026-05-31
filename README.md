@@ -160,7 +160,7 @@ Primary archives follow the pattern `<name>.pNN.whpar`, where **N** is the overh
 The **pNN** value is the *cumulative* overhead of the archive being supplemented, and **+MM** is what this supplement adds. Repair auto-discovers all `.whpar` files with a matching base name.
 
 | Option | Description |
-|---|---|---|
+|---|---|
 | `-b <sizeKB>` | Block size in KB (e.g. `64`, `1M`, `4G`). Auto-selected by default. |
 | `-j <numJobs>` | Parallel encoding tracks (create/add) or concurrent decoders (repair). Default: CPU core count. |
 | `--xxh64` | Use XXH3\_64bit hashing instead of XXH32 for faster/larger checksums. |
