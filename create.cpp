@@ -18,6 +18,8 @@
 #include "parity.h"
 #include "wirehair.h"
 
+ProgressCallback g_progressCallback;
+
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 

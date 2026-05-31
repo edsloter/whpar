@@ -1,0 +1,4 @@
+#include "resource.h"
+
+IDI_ICON1     ICON "whpar.ico"
+IDI_WHPARFILE ICON "whpar_files.ico"

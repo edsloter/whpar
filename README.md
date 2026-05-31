@@ -66,10 +66,42 @@ Clone the repository and run the provided PowerShell helper from the repository 
 git clone https://github.com/edsloter/whpar
 cd whpar
 
-# Build the executable
+# Build the CLI executable
 ./build.ps1
 ```
 The compiled binary will be located at `build\Release\whpar.exe`.
+
+### GUI Build (Windows)
+
+The GUI frontend requires [wxWidgets](https://www.wxwidgets.org/) installed at `C:\wxWidgets` (or the path set in the `WXWIN` environment variable).
+
+```powershell
+# Build the GUI executable with statically-linked wxWidgets
+.\build_gui.ps1 -static
+```
+The compiled binary will be located at `build\Release\whpar-gui.exe`. The `-static` flag bundles wxWidgets directly into the exe so no separate DLLs are needed.
+
+### Build Steps (Linux)
+
+```bash
+# Clone the repository
+git clone https://github.com/edsloter/whpar
+cd whpar
+
+# Build the CLI executable
+./build.sh
+```
+The compiled binary will be located at `build/whpar`.
+
+### GUI Build (Linux)
+
+The GUI frontend requires [wxWidgets](https://www.wxwidgets.org/) development headers (`libwxgtk3.0-dev` or `libwxgtk3.2-dev` depending on your distribution).
+
+```bash
+# Build the GUI executable
+./build_gui.sh
+```
+The compiled binary will be located at `build/whpar-gui`.
 
 ---
 

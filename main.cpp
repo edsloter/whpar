@@ -245,10 +245,11 @@ int main(int argc, char* argv[]) {
         if (outArg.empty()) {
             size_t lastSep = sourcePaths[0].find_last_of("/\\");
             std::string baseName = (lastSep == std::string::npos) ? sourcePaths[0] : sourcePaths[0].substr(lastSep + 1);
+            std::string sourceDir = (lastSep == std::string::npos) ? "" : sourcePaths[0].substr(0, lastSep + 1);
             size_t dot = baseName.find_last_of('.');
             if (dot != std::string::npos)
                 baseName = baseName.substr(0, dot);
-            parityPath = baseName + pSuffix;
+            parityPath = sourceDir + baseName + pSuffix;
             std::cerr << "Warning: No output specified. Using '" << parityPath << "'.\n";
         } else {
             parityPath = outArg;

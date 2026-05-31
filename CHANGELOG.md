@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.0.5 — 2026-05-31
+
+### Added
+- GUI beta built with wxWidgets, should have every ability CLI does. 
+- GUI icon support — embedded `whpar.ico` resource now shows on the title bar and taskbar.
+- `resource.h` / `resources.rc` for icon resource compilation via CMake.
+- GUI build instructions in README.
+
 ## 0.0.4 — 2026-05-25
 
 ### Added

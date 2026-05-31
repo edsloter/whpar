@@ -19,7 +19,13 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <functional>
+#include <atomic>
 #include <iostream>
+
+// ── Progress callback (set by GUI for visual progress) ──
+using ProgressCallback = std::function<void(int)>;
+extern ProgressCallback g_progressCallback;
 #include <fstream>
 #include <atomic>
 #include <chrono>
@@ -29,7 +35,7 @@
 
 #define WHPAR_MAGIC 0x32324857
 #define WHPAR_PKT_MAGIC 0x4B504B54
-#define WHPAR_VERSION "0.0.4"
+#define WHPAR_VERSION "0.0.5"
 
 // On-disk format is little-endian.
 // On x86 (LE) these are no-ops; on big-endian they swap via compiler intrinsics.
@@ -133,6 +139,7 @@ struct Progress {
         for (int i = bar + 1; i < 40; ++i) std::cout << " ";
         std::cout << "] " << pct << "%" << std::flush;
         if (pct == 100) std::cout << "\n";
+        if (g_progressCallback) g_progressCallback(pct);
     }
 
     void tick() {
